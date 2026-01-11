@@ -13,14 +13,20 @@
 
 ## Quickstart
 ```bash
-chmod +x ralph
-./ralph "Add user authentication with email/password"
+chmod +x ralph davairalph davairalph.sh davai davai.sh ralph.sh
+./davairalph "Add user authentication with email/password"
 ```
 
 ### YOLO mode (max autonomy)
 ```bash
-./ralph --yolo "Build REST API for todo items"
+./davairalph --yolo "Build REST API for todo items"
 ```
+
+## Aliases
+- `./davairalph` (preferred)
+- `./davairalph.sh` (explicit bash script)
+- `./davai` / `./davai.sh` (legacy)
+- `./ralph` / `./ralph.sh` (legacy)
 
 ## Requirements
 - Bash
@@ -38,10 +44,10 @@ Optional:
 
 ## Common Commands
 ```bash
-./ralph --resume
-./ralph --status
-./ralph --reset
-./ralph --isolate --parallel 4 "Feature description"
+./davairalph --resume
+./davairalph --status
+./davairalph --reset
+./davairalph --isolate --parallel 4 "Feature description"
 ```
 
 ## Safety Notes

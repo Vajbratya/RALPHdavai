@@ -1,0 +1,2517 @@
+#!/usr/bin/env bash
+#═══════════════════════════════════════════════════════════════════════════════
+#
+#  ██████╗  █████╗ ██╗     ██████╗ ██╗  ██╗    ██╗   ██╗ ██████╗
+#  ██╔══██╗██╔══██╗██║     ██╔══██╗██║  ██║    ██║   ██║ ╚════██╗
+#  ██████╔╝███████║██║     ██████╔╝███████║    ██║   ██║  █████╔╝
+#  ██╔══██╗██╔══██║██║     ██╔═══╝ ██╔══██║    ╚██╗ ██╔╝  ╚═══██╗
+#  ██║  ██║██║  ██║███████╗██║     ██║  ██║     ╚████╔╝  ██████╔╝
+#  ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝     ╚═╝  ╚═╝      ╚═══╝   ╚═════╝
+#
+#  Autonomous AI Coding Orchestrator
+#
+#  Features:
+#    • Multi-stack detection (Node/Python/Rust/Go/Ruby)
+#    • Codebase analysis before PRD generation
+#    • Dependency-aware story scheduling
+#    • Self-healing: auto-splits stories that fail repeatedly
+#    • Worktree isolation (session or per-story in parallel mode)
+#    • Parallel story execution (requires --isolate)
+#    • Cost tracking and token estimation
+#    • Webhook notifications (Slack, Discord, generic)
+#    • Resume, checkpoint, dry-run modes
+#    • Web dashboard + JSONL event stream
+#
+#  Usage:
+#    ./ralph "your feature description"
+#    ./ralph --resume
+#    ./ralph --status
+#    ./ralph --dashboard
+#
+#═══════════════════════════════════════════════════════════════════════════════
+set -Euo pipefail
+shopt -s inherit_errexit 2>/dev/null || true
+IFS=$'\n\t'
+
+readonly VERSION="3.1.0"
+readonly BRAND_NAME="РАЛЬФ"
+readonly SCRIPT_NAME="${0##*/}"
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_NAME"
+readonly LAUNCH_DIR="$(pwd -P)"
+
+#───────────────────────────────────────────────────────────────────────────────
+# Configuration
+#───────────────────────────────────────────────────────────────────────────────
+: "${RALPH_ROOT:=$LAUNCH_DIR}"
+: "${RALPH_DIR:=.ralph}"
+: "${RALPH_MAX_ITER:=100}"
+: "${RALPH_MAX_TRIES:=3}"
+: "${RALPH_PARALLEL:=1}"
+: "${RALPH_TIMEOUT:=600}"
+: "${RALPH_SAFE:=0}"
+: "${RALPH_VERIFY:=1}"
+: "${RALPH_ISOLATE:=0}"
+: "${RALPH_WEBHOOK:=}"
+: "${RALPH_WEBHOOK_KIND:=auto}"
+: "${RALPH_CLAUDE:=claude}"
+: "${RALPH_MODEL:=}"
+: "${RALPH_DASHBOARD:=1}"
+: "${RALPH_DASHBOARD_PORT:=3333}"
+: "${RALPH_DASHBOARD_HOST:=127.0.0.1}"
+: "${RALPH_DASHBOARD_OPEN:=1}"
+: "${RALPH_PUBLIC:=1}"
+: "${RALPH_TUNNEL:=auto}"
+: "${RALPH_STREAM_AI:=1}"
+: "${RALPH_DRY_RUN:=0}"
+: "${RALPH_NO_COMMIT:=0}"
+: "${RALPH_USAGE_TRACKING:=1}"
+: "${RALPH_TOKEN_COST:=}"
+: "${RALPH_WORKTREE_ROOT:=${HOME:-/tmp}/.ralph-worktrees}"
+
+EVENTS_FILE=""
+DASHBOARD_PID=""
+TUNNEL_PID=""
+PUBLIC_URL=""
+LOG_FILE=""
+PRD_FILE=""
+LOCK_FILE=""
+TIMEOUT_CMD=()
+WORKTREE_ROOT=""
+SESSION_FILE=""
+SESSION_WORKTREE=""
+SESSION_BRANCH=""
+PARALLEL_FAILS=0
+
+#───────────────────────────────────────────────────────────────────────────────
+# Terminal & Colors
+#───────────────────────────────────────────────────────────────────────────────
+setup_colors() {
+    if [[ -t 1 ]] && [[ "${TERM:-}" != "dumb" ]]; then
+        readonly RED=$'\e[31m' GREEN=$'\e[32m' YELLOW=$'\e[33m' BLUE=$'\e[34m'
+        readonly MAGENTA=$'\e[35m' CYAN=$'\e[36m' WHITE=$'\e[97m' GRAY=$'\e[90m'
+        readonly BOLD=$'\e[1m' DIM=$'\e[2m' ITALIC=$'\e[3m' RESET=$'\e[0m'
+        readonly CLEAR_LINE=$'\e[2K\r' HIDE_CURSOR=$'\e[?25l' SHOW_CURSOR=$'\e[?25h'
+    else
+        readonly RED='' GREEN='' YELLOW='' BLUE='' MAGENTA='' CYAN='' WHITE=''
+        readonly GRAY='' BOLD='' DIM='' ITALIC='' RESET='' CLEAR_LINE=''
+        readonly HIDE_CURSOR='' SHOW_CURSOR=''
+    fi
+}
+setup_colors
+
+#───────────────────────────────────────────────────────────────────────────────
+# Logging
+#───────────────────────────────────────────────────────────────────────────────
+LOG_LEVEL=1  # 0=quiet, 1=normal, 2=verbose, 3=debug
+
+_ts() { date '+%H:%M:%S'; }
+_log() { [[ -n "$LOG_FILE" ]] && printf '[%s] %s\n' "$(_ts)" "$*" >> "$LOG_FILE"; }
+
+emit_event() {
+    [[ -n "$EVENTS_FILE" ]] || return 0
+    command -v jq &>/dev/null || return 0
+
+    local event_type="$1"
+    shift
+    local json
+
+    case "$event_type" in
+        init)
+            json=$(jq -nc --arg t "$event_type" --arg f "$1" --arg b "$2" --arg s "$3" --argjson stories "$4" \
+                '{type: $t, feature: $f, branch: $b, stack: $s, stories: $stories}')
+            ;;
+        status)
+            json=$(jq -nc --arg t "$event_type" --arg s "$1" '{type: $t, status: $s}')
+            ;;
+        iteration)
+            json=$(jq -nc --arg t "$event_type" --argjson i "$1" '{type: $t, iteration: $i}')
+            ;;
+        story_start)
+            json=$(jq -nc --arg t "$event_type" --argjson story "$1" '{type: $t, story: $story}')
+            ;;
+        story_done)
+            json=$(jq -nc --arg t "$event_type" --arg id "$1" '{type: $t, id: $id}')
+            ;;
+        story_failed)
+            json=$(jq -nc --arg t "$event_type" --arg id "$1" --argjson tries "$2" '{type: $t, id: $id, tries: $tries}')
+            ;;
+        story_blocked)
+            json=$(jq -nc --arg t "$event_type" --arg id "$1" --arg r "$2" '{type: $t, id: $id, reason: $r}')
+            ;;
+        verify_start)
+            json=$(jq -nc --arg t "$event_type" --arg id "$1" '{type: $t, id: $id}')
+            ;;
+        verify_result)
+            local passed="false"; [[ "$3" == "true" ]] && passed="true"
+            json=$(jq -nc --arg t "$event_type" --arg id "$1" --arg c "$2" --argjson p "$passed" '{type: $t, id: $id, check: $c, passed: $p}')
+            ;;
+        ai)
+            json=$(jq -nc --arg t "$event_type" --arg id "$1" --arg line "$2" '{type: $t, id: $id, line: $line}')
+            ;;
+        public_url)
+            json=$(jq -nc --arg t "$event_type" --arg url "$1" '{type: $t, url: $url}')
+            ;;
+        complete)
+            json=$(jq -nc --arg t "$event_type" '{type: $t}')
+            ;;
+        error)
+            json=$(jq -nc --arg t "$event_type" --arg m "$1" '{type: $t, message: $m}')
+            ;;
+        log)
+            json=$(jq -nc --arg t "$event_type" --arg l "$1" --arg m "$2" '{type: $t, level: $l, message: $m}')
+            ;;
+        *)
+            json=$(jq -nc --arg t "$event_type" '{type: $t}')
+            ;;
+    esac
+
+    if [[ -n "$EVENTS_FILE" ]]; then
+        if command -v flock &>/dev/null; then
+            { flock 200; printf '%s\n' "$json"; } 200>>"$EVENTS_FILE"
+        else
+            printf '%s\n' "$json" >> "$EVENTS_FILE"
+        fi
+    fi
+}
+
+log()   { _log "$*"; }
+
+debug() {
+    ((LOG_LEVEL >= 3)) && printf '%s[DBG]%s %s\n' "$GRAY" "$RESET" "$*"
+    _log "[DEBUG] $*"
+}
+
+info() {
+    ((LOG_LEVEL >= 1)) && printf '%s[%s]%s %s\n' "$DIM" "$(_ts)" "$RESET" "$*"
+    _log "[INFO] $*"
+    emit_event "log" "info" "$*"
+}
+
+ok() {
+    ((LOG_LEVEL >= 1)) && printf '%s✓%s %s\n' "$GREEN" "$RESET" "$*"
+    _log "[OK] $*"
+    emit_event "log" "success" "$*"
+}
+
+warn() {
+    ((LOG_LEVEL >= 1)) && printf '%s⚠%s %s\n' "$YELLOW" "$RESET" "$*" >&2
+    _log "[WARN] $*"
+    emit_event "log" "warning" "$*"
+}
+
+err() {
+    printf '%s✗%s %s\n' "$RED" "$RESET" "$*" >&2
+    _log "[ERR] $*"
+    emit_event "log" "error" "$*"
+}
+
+die() {
+    err "$*"
+    emit_event "error" "$*"
+    notify_webhook "error" "$*" 2>/dev/null || true
+    cleanup
+    exit 1
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# Cleanup & Signals
+#───────────────────────────────────────────────────────────────────────────────
+CLEANUP_TASKS=()
+
+cleanup() {
+    printf '%s' "$SHOW_CURSOR"
+    [[ -n "$LOCK_FILE" && -f "$LOCK_FILE" ]] && rm -f "$LOCK_FILE"
+    [[ -n "$DASHBOARD_PID" ]] && kill "$DASHBOARD_PID" 2>/dev/null || true
+    [[ -n "$TUNNEL_PID" ]] && kill "$TUNNEL_PID" 2>/dev/null || true
+    for task in "${CLEANUP_TASKS[@]:-}"; do
+        eval "$task" 2>/dev/null || true
+    done
+}
+
+on_exit() {
+    local code=$?
+    cleanup
+    exit $code
+}
+
+on_error() {
+    local code=$? line="${BASH_LINENO[0]}" cmd="$BASH_COMMAND"
+    err "Failed at line $line: $cmd (exit $code)"
+    cleanup
+    exit $code
+}
+
+on_interrupt() {
+    printf '\n'
+    warn "Interrupted. Progress saved. Run './ralph --resume' to continue."
+    cleanup
+    exit 130
+}
+
+trap on_exit EXIT
+trap on_error ERR
+trap on_interrupt INT TERM
+
+#───────────────────────────────────────────────────────────────────────────────
+# Utilities
+#───────────────────────────────────────────────────────────────────────────────
+require() {
+    local cmd="$1" pkg="${2:-$1}"
+    command -v "$cmd" &>/dev/null || die "Required: $cmd (install: $pkg)"
+}
+
+require_int() {
+    local opt="$1" val="$2" min="${3:-0}"
+    [[ -n "$val" ]] || die "Missing value for $opt"
+    [[ "$val" =~ ^[0-9]+$ ]] || die "Invalid value for $opt: $val"
+    ((val >= min)) || die "Value for $opt must be >= $min"
+}
+
+ensure_git_repo() {
+    git rev-parse --is-inside-work-tree &>/dev/null || die "Not inside a git repository"
+}
+
+detect_timeout_cmd() {
+    if command -v timeout &>/dev/null; then
+        TIMEOUT_CMD=(timeout --signal=TERM)
+    elif command -v gtimeout &>/dev/null; then
+        TIMEOUT_CMD=(gtimeout --signal=TERM)
+    else
+        TIMEOUT_CMD=()
+    fi
+}
+
+detect_cpu_count() {
+    local cpu=""
+    if command -v getconf &>/dev/null; then
+        cpu=$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)
+    fi
+    if [[ -z "$cpu" ]] && command -v sysctl &>/dev/null; then
+        cpu=$(sysctl -n hw.ncpu 2>/dev/null || true)
+    fi
+    if [[ -z "$cpu" ]] && command -v nproc &>/dev/null; then
+        cpu=$(nproc 2>/dev/null || true)
+    fi
+    [[ "$cpu" =~ ^[0-9]+$ ]] || cpu=4
+    printf '%s' "$cpu"
+}
+
+with_timeout() {
+    local secs="$1"; shift
+    if ((secs > 0)) && ((${#TIMEOUT_CMD[@]})); then
+        "${TIMEOUT_CMD[@]}" "$secs" "$@"
+    else
+        "$@"
+    fi
+}
+
+slugify() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//' | cut -c1-40
+}
+
+slugify_branch() {
+    # Slightly longer than slugify() since git branches can be longer without hurting UX.
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//' | cut -c1-60
+}
+
+sanitize_git_branch() {
+    local input="$1"
+    input=$(printf '%s' "$input" | tr -d '\r' | tr -d '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [[ -z "$input" ]] && input="ralph/feature"
+
+    if git check-ref-format --branch "$input" &>/dev/null; then
+        printf '%s' "$input"
+        return 0
+    fi
+
+    local rest="$input"
+    [[ "$rest" == ralph/* ]] && rest="${rest#ralph/}"
+    rest=$(slugify_branch "$rest")
+    [[ -z "$rest" ]] && rest="feature"
+
+    local sanitized="ralph/$rest"
+    if git check-ref-format --branch "$sanitized" &>/dev/null; then
+        warn "Invalid branch '$input' from PRD; using '$sanitized'"
+        printf '%s' "$sanitized"
+        return 0
+    fi
+
+    die "Invalid branch name in PRD: $input"
+}
+
+checkout_branch_or_die() {
+    local branch="$1"
+    if git checkout -b "$branch" &>/dev/null; then
+        return 0
+    fi
+    if git checkout "$branch" &>/dev/null; then
+        return 0
+    fi
+    die "Could not checkout/create branch: $branch"
+}
+
+json_escape() {
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\r'/\\r}
+    s=${s//$'\t'/\\t}
+    printf '%s' "$s"
+}
+
+json_extract() {
+    python3 - <<'PY'
+import sys, json
+s = sys.stdin.read()
+decoder = json.JSONDecoder()
+for i, c in enumerate(s):
+    if c in '{[':
+        try:
+            obj, _ = decoder.raw_decode(s[i:])
+            print(json.dumps(obj, indent=2))
+            sys.exit(0)
+        except Exception:
+            continue
+sys.exit(1)
+PY
+}
+
+jq_inplace() {
+    local file="$1"; shift
+    local tmp
+    tmp=$(mktemp "${file}.tmp.XXXXXX")
+    if jq "$@" "$file" > "$tmp"; then
+        mv "$tmp" "$file"
+    else
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+port_in_use() {
+    local port="$1"
+    command -v lsof &>/dev/null || return 1
+    lsof -iTCP:"$port" -sTCP:LISTEN -t &>/dev/null
+}
+
+choose_dashboard_port() {
+    local port="$RALPH_DASHBOARD_PORT"
+    if port_in_use "$port"; then
+        local candidate
+        for candidate in $(seq 3334 3350); do
+            if ! port_in_use "$candidate"; then
+                port="$candidate"
+                break
+            fi
+        done
+        if port_in_use "$port"; then
+            warn "Dashboard port in use; disabling dashboard"
+            RALPH_DASHBOARD=0
+            return
+        fi
+    fi
+    RALPH_DASHBOARD_PORT="$port"
+}
+
+estimate_tokens() {
+    local chars="$1"
+    echo $(((chars + 3) / 4))
+}
+
+log_usage() {
+    ((RALPH_USAGE_TRACKING == 0)) && return 0
+    local kind="$1" prompt_file="$2" response_file="$3"
+    [[ -f "$prompt_file" && -f "$response_file" ]] || return 0
+
+    local prompt_chars response_chars prompt_tokens response_tokens total_tokens cost
+    prompt_chars=$(wc -c < "$prompt_file" | tr -d ' ')
+    response_chars=$(wc -c < "$response_file" | tr -d ' ')
+    prompt_tokens=$(estimate_tokens "$prompt_chars")
+    response_tokens=$(estimate_tokens "$response_chars")
+    total_tokens=$((prompt_tokens + response_tokens))
+    cost=""
+
+    if [[ -n "$RALPH_TOKEN_COST" ]]; then
+        cost=$(awk -v tokens="$total_tokens" -v rate="$RALPH_TOKEN_COST" 'BEGIN { printf "%.6f", (tokens/1000)*rate }')
+    fi
+
+    jq -nc \
+        --arg ts "$(date -Iseconds)" \
+        --arg kind "$kind" \
+        --argjson prompt_chars "$prompt_chars" \
+        --argjson response_chars "$response_chars" \
+        --argjson prompt_tokens "$prompt_tokens" \
+        --argjson response_tokens "$response_tokens" \
+        --argjson total_tokens "$total_tokens" \
+        --arg cost "$cost" \
+        '{timestamp: $ts, kind: $kind, prompt_chars: $prompt_chars, response_chars: $response_chars, prompt_tokens: $prompt_tokens, response_tokens: $response_tokens, total_tokens: $total_tokens, est_cost: $cost}' \
+        >> "$RALPH_DIR/usage.jsonl"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# Webhooks
+#───────────────────────────────────────────────────────────────────────────────
+notify_webhook() {
+    [[ -z "$RALPH_WEBHOOK" ]] && return 0
+    command -v curl &>/dev/null || { warn "curl not available; skipping webhook"; return 0; }
+
+    local event="$1"; shift
+    local payload=""
+    local kind="$RALPH_WEBHOOK_KIND"
+    local brand_esc
+    brand_esc=$(json_escape "$BRAND_NAME")
+
+    if [[ "$kind" == "auto" ]]; then
+        if [[ "$RALPH_WEBHOOK" == *"hooks.slack.com"* ]]; then
+            kind="slack"
+        elif [[ "$RALPH_WEBHOOK" == *"discord.com/api/webhooks"* || "$RALPH_WEBHOOK" == *"discordapp.com/api/webhooks"* ]]; then
+            kind="discord"
+        else
+            kind="generic"
+        fi
+    fi
+
+    case "$kind" in
+        slack)
+            case "$event" in
+                start)
+                    local feature="$1"
+                    local branch
+                    branch=$(git branch --show-current 2>/dev/null || echo "unknown")
+                    local feature_esc branch_esc
+                    feature_esc=$(json_escape "$feature")
+                    branch_esc=$(json_escape "$branch")
+                    payload='{
+                        "blocks": [
+                            {"type": "header", "text": {"type": "plain_text", "text": "🚀 '"$brand_esc"' Started", "emoji": true}},
+                            {"type": "section", "fields": [
+                                {"type": "mrkdwn", "text": "*Feature:*\n'"$feature_esc"'"},
+                                {"type": "mrkdwn", "text": "*Branch:*\n'"$branch_esc"'"}
+                            ]},
+                            {"type": "context", "elements": [{"type": "mrkdwn", "text": "Started at '"$(date '+%H:%M:%S')"'"}]}
+                        ]
+                    }'
+                    ;;
+                story_done)
+                    local id="$1" title="$2" total="$3" done="$4"
+                    local id_esc title_esc
+                    id_esc=$(json_escape "$id")
+                    title_esc=$(json_escape "$title")
+                    payload='{
+                        "blocks": [
+                            {"type": "section", "text": {"type": "mrkdwn", "text": "✅ *'"$id_esc"'* completed\n'"$title_esc"'"}},
+                            {"type": "context", "elements": [{"type": "mrkdwn", "text": "Progress: '"$done"'/'"$total"' stories"}]}
+                        ]
+                    }'
+                    ;;
+                story_failed)
+                    local id="$1" title="$2" tries="$3"
+                    local id_esc title_esc
+                    id_esc=$(json_escape "$id")
+                    title_esc=$(json_escape "$title")
+                    payload='{
+                        "blocks": [
+                            {"type": "section", "text": {"type": "mrkdwn", "text": "⚠️ *'"$id_esc"'* failed (attempt '"$tries"')\n'"$title_esc"'"}}
+                        ]
+                    }'
+                    ;;
+                complete)
+                    local total="$1" duration="$2"
+                    local duration_esc
+                    duration_esc=$(json_escape "$duration")
+                    payload='{
+                        "blocks": [
+                            {"type": "header", "text": {"type": "plain_text", "text": "🎉 '"$brand_esc"' Complete!", "emoji": true}},
+                            {"type": "section", "fields": [
+                                {"type": "mrkdwn", "text": "*Stories:*\n'"$total"' completed"},
+                                {"type": "mrkdwn", "text": "*Duration:*\n'"$duration_esc"'"}
+                            ]},
+                            {"type": "context", "elements": [{"type": "mrkdwn", "text": "Finished at '"$(date '+%H:%M:%S')"'"}]}
+                        ]
+                    }'
+                    ;;
+                error)
+                    local msg="$1"
+                    local msg_esc
+                    msg_esc=$(json_escape "$msg")
+                    payload='{
+                        "blocks": [
+                            {"type": "section", "text": {"type": "mrkdwn", "text": "❌ *'"$brand_esc"' Error*\n'"$msg_esc"'"}}
+                        ]
+                    }'
+                    ;;
+                *)
+                    local msg_esc event_esc
+                    event_esc=$(json_escape "$event")
+                    msg_esc=$(json_escape "$*")
+                    payload='{"text":"['"$brand_esc"'] '"$event_esc"': '"$msg_esc"'"}'
+                    ;;
+            esac
+            ;;
+        discord)
+            case "$event" in
+                start)
+                    payload='{"content":"🚀 '"$brand_esc"' started: '"$(json_escape "$1")"'"}'
+                    ;;
+                story_done)
+                    payload='{"content":"✅ '"$(json_escape "$1")"' completed: '"$(json_escape "$2")"'"}'
+                    ;;
+                story_failed)
+                    payload='{"content":"⚠️ '"$(json_escape "$1")"' failed (attempt '"$3"')"}'
+                    ;;
+                complete)
+                    payload='{"content":"🎉 '"$brand_esc"' complete: '"$1"' stories in '"$(json_escape "$2")"'"}'
+                    ;;
+                error)
+                    payload='{"content":"❌ '"$brand_esc"' error: '"$(json_escape "$1")"'"}'
+                    ;;
+                *)
+                    payload='{"content":"['"$brand_esc"'] '"$event"': '"$(json_escape "$*")"'"}'
+                    ;;
+            esac
+            ;;
+        *)
+            payload=$(jq -nc --arg event "$event" --arg message "$*" '{event:$event, message:$message}')
+            ;;
+    esac
+
+    curl -sS -X POST "$RALPH_WEBHOOK" \
+        -H "Content-Type: application/json" \
+        -d "$payload" \
+        &>/dev/null &
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# Dashboard & Events
+#───────────────────────────────────────────────────────────────────────────────
+dashboard_url() {
+    local host="$RALPH_DASHBOARD_HOST"
+    [[ -z "$host" || "$host" == "0.0.0.0" ]] && host="localhost"
+    printf 'http://%s:%s' "$host" "$RALPH_DASHBOARD_PORT"
+}
+
+dashboard_tunnel_url() {
+    local host="$RALPH_DASHBOARD_HOST"
+    [[ -z "$host" || "$host" == "0.0.0.0" ]] && host="127.0.0.1"
+    printf 'http://%s:%s' "$host" "$RALPH_DASHBOARD_PORT"
+}
+
+open_browser() {
+    ((RALPH_DASHBOARD_OPEN == 0)) && return 0
+
+    local url="$1"
+    if command -v open &>/dev/null; then
+        open "$url" &>/dev/null || true  # macOS
+    elif command -v xdg-open &>/dev/null; then
+        xdg-open "$url" &>/dev/null || true  # Linux
+    elif command -v wslview &>/dev/null; then
+        wslview "$url" &>/dev/null || true  # WSL
+    fi
+}
+
+start_public_tunnel() {
+    ((RALPH_PUBLIC == 0)) && return 0
+
+    local kind="$RALPH_TUNNEL"
+    local local_url
+    local_url=$(dashboard_tunnel_url)
+
+    if [[ "$kind" == "auto" ]]; then
+        if command -v cloudflared &>/dev/null; then
+            kind="cloudflared"
+        elif command -v ngrok &>/dev/null; then
+            kind="ngrok"
+        else
+            kind="none"
+        fi
+    fi
+
+    local log_file="$RALPH_DIR/tunnel.log"
+    : > "$log_file"
+
+    case "$kind" in
+        cloudflared)
+            cloudflared tunnel --url "$local_url" --no-autoupdate > "$log_file" 2>&1 &
+            TUNNEL_PID=$!
+            CLEANUP_TASKS+=("kill $TUNNEL_PID 2>/dev/null")
+            ;;
+        ngrok)
+            ngrok http "$RALPH_DASHBOARD_PORT" --log=stdout > "$log_file" 2>&1 &
+            TUNNEL_PID=$!
+            CLEANUP_TASKS+=("kill $TUNNEL_PID 2>/dev/null")
+            ;;
+        *)
+            warn "Public dashboard requested but no tunnel tool found (cloudflared/ngrok)"
+            return 1
+            ;;
+    esac
+
+    local attempt
+    for attempt in $(seq 1 40); do
+        if [[ "$kind" == "cloudflared" ]]; then
+            PUBLIC_URL=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' "$log_file" | head -n1 || true)
+        elif [[ "$kind" == "ngrok" ]]; then
+            if command -v curl &>/dev/null; then
+                PUBLIC_URL=$(curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[]?.public_url | select(startswith("https://"))' | head -n1 || true)
+            fi
+            [[ -z "$PUBLIC_URL" ]] && PUBLIC_URL=$(grep -Eo 'https://[a-zA-Z0-9.-]+\.ngrok(-free)?\.app' "$log_file" | head -n1 || true)
+        fi
+        [[ -n "$PUBLIC_URL" ]] && break
+        sleep 0.25
+    done
+
+    if [[ -n "$PUBLIC_URL" ]]; then
+        info "Public dashboard: ${BOLD}$PUBLIC_URL${RESET}"
+        emit_event "public_url" "$PUBLIC_URL"
+    else
+        warn "Public URL not available; check $log_file"
+    fi
+}
+
+start_dashboard() {
+    ((RALPH_DASHBOARD == 0)) && return 0
+
+    choose_dashboard_port
+    ((RALPH_DASHBOARD == 0)) && return 0
+
+    EVENTS_FILE="$RALPH_DIR/events.jsonl"
+    : > "$EVENTS_FILE"
+
+    local dashboard_html
+    dashboard_html=$(cat << 'DASHBOARD_EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>РАЛЬФ Live</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        :root {
+            --bg: #f7f7f6;
+            --surface: #ffffff;
+            --ink: #111111;
+            --muted: #6a6a6a;
+            --line: #e3e3e3;
+            --shadow: 0 12px 30px rgba(0,0,0,0.08);
+            --soft-shadow: 0 10px 24px rgba(0,0,0,0.05);
+            --accent: #111111;
+            --accent-soft: #9a9a9a;
+        }
+        body {
+            font-family: "Space Grotesk", sans-serif;
+            color: var(--ink);
+            background:
+                radial-gradient(circle at 20% 20%, rgba(0,0,0,0.04), transparent 55%),
+                radial-gradient(circle at 80% 10%, rgba(0,0,0,0.03), transparent 45%),
+                linear-gradient(180deg, #fbfbfb 0%, #f1f1f1 100%);
+            min-height: 100vh;
+        }
+        .page { max-width: 1440px; margin: 28px auto 60px; padding: 0 22px; }
+        .top { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 20px; }
+        .brand { display: flex; flex-direction: column; gap: 6px; }
+        .brand-mark { font-size: 26px; font-weight: 700; letter-spacing: 0.5rem; text-transform: uppercase; }
+        .brand-tag { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.2rem; }
+        .status-stack { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }
+        .status-badge {
+            display: inline-flex; align-items: center; gap: 8px;
+            border-radius: 999px; padding: 8px 16px; font-weight: 600; font-size: 13px;
+            background: #e9e9e9; color: var(--ink); border: 1px solid var(--line);
+            text-transform: uppercase; letter-spacing: 0.08em;
+        }
+        .status-badge.running { background: #111111; color: #ffffff; }
+        .status-badge.complete { background: #111111; color: #ffffff; }
+        .status-badge.error { background: #1c1c1c; color: #ffffff; }
+        .status-badge.idle { background: #efefef; color: #333333; }
+        .status-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+        .status-subtle { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.12em; }
+        .layout { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 20px; }
+        @media (max-width: 1180px) { .layout { grid-template-columns: 1fr; } }
+        .card {
+            background: var(--surface); border: 1px solid var(--line); border-radius: 16px;
+            box-shadow: var(--soft-shadow);
+        }
+        .card-header { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px; border-bottom: 1px solid var(--line); }
+        .card-header h2 { font-size: 14px; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); }
+        .card-body { padding: 20px; }
+        .feature { background: #fafafa; border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 18px; }
+        .feature-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.2em; color: var(--muted); }
+        .feature-value { font-size: 18px; font-weight: 600; margin-top: 6px; }
+        .meta-grid { margin-top: 16px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+        .meta-item { font-size: 12px; color: var(--muted); display: flex; flex-direction: column; gap: 4px; }
+        .meta-item strong, .meta-item a { color: var(--ink); font-weight: 600; text-decoration: none; word-break: break-all; }
+        .meta-item a:hover { text-decoration: underline; }
+        .public-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .chip {
+            border: 1px solid var(--line);
+            background: #f5f5f5;
+            color: var(--muted);
+            padding: 6px 10px;
+            border-radius: 999px;
+            font-size: 11px;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            cursor: pointer;
+        }
+        .chip:disabled { opacity: 0.4; cursor: not-allowed; }
+        .progress-section { margin-bottom: 18px; }
+        .progress-header { display: flex; justify-content: space-between; margin-bottom: 10px; }
+        .progress-label { font-size: 12px; color: var(--muted); letter-spacing: 0.12em; text-transform: uppercase; }
+        .progress-value { font-size: 26px; font-weight: 700; }
+        .progress-bar { height: 8px; background: #ededed; border-radius: 999px; overflow: hidden; }
+        .progress-fill { height: 100%; background: linear-gradient(90deg, #111111, #444444); border-radius: 999px; transition: width 0.5s ease; }
+        .stats-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+        .stat-card { border: 1px solid var(--line); border-radius: 12px; padding: 14px; text-align: center; background: #fafafa; }
+        .stat-value { font-size: 22px; font-weight: 700; }
+        .stat-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.12em; margin-top: 6px; }
+        .current-story { background: #111111; color: #ffffff; border-radius: 12px; padding: 16px; }
+        .current-story .meta { font-size: 11px; color: rgba(255,255,255,0.7); text-transform: uppercase; letter-spacing: 0.12em; }
+        .stream, .logs-container {
+            height: 340px; overflow-y: auto; font-family: "IBM Plex Mono", monospace;
+            font-size: 12px; line-height: 1.6; background: #f9f9f9; border: 1px solid var(--line);
+            border-radius: 12px; padding: 16px;
+        }
+        .ai-line, .log-entry { display: flex; gap: 12px; padding: 4px 0; }
+        .ai-id { font-weight: 600; color: var(--ink); min-width: 42px; }
+        .ai-text, .log-msg { color: #3b3b3b; white-space: pre-wrap; word-break: break-word; }
+        .log-time { color: var(--muted); }
+        .stories-list { max-height: 520px; overflow-y: auto; }
+        .story-item { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+        .story-item:last-child { border-bottom: none; }
+        .story-icon { width: 22px; height: 22px; border-radius: 50%; border: 1px solid var(--line); display: flex; align-items: center; justify-content: center; font-size: 11px; color: var(--ink); background: #f3f3f3; flex-shrink: 0; }
+        .story-item.active { background: #f6f6f6; }
+        .story-info { flex: 1; min-width: 0; }
+        .story-id { font-weight: 600; font-size: 12px; }
+        .story-title { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .story-meta { font-size: 11px; color: var(--muted); text-align: right; }
+        .empty-state { text-align: center; padding: 40px 20px; color: var(--muted); font-size: 12px; }
+        .connection-status { position: fixed; bottom: 20px; right: 20px; padding: 8px 14px; border-radius: 999px; font-size: 11px; border: 1px solid var(--line); background: #ffffff; color: var(--muted); letter-spacing: 0.1em; text-transform: uppercase; }
+        .connection-status.connected { color: var(--ink); border-color: var(--ink); }
+    </style>
+</head>
+<body>
+    <div class="page">
+        <header class="top">
+            <div class="brand">
+                <div class="brand-mark">РАЛЬФ</div>
+                <div class="brand-tag">Autonomous coding orchestrator</div>
+            </div>
+            <div class="status-stack">
+                <div id="statusBadge" class="status-badge idle"><span class="status-dot"></span><span>Idle</span></div>
+                <div id="agentState" class="status-subtle">Agent: Off</div>
+            </div>
+        </header>
+        <div class="layout">
+            <div class="main">
+                <div class="card" style="margin-bottom: 20px;">
+                    <div class="card-header"><h2>Progress</h2><span id="iteration" class="status-subtle">Iteration 0</span></div>
+                    <div class="card-body">
+                        <div class="feature">
+                            <div class="feature-label">Feature</div>
+                            <div id="featureName" class="feature-value">—</div>
+                            <div class="meta-grid">
+                                <div class="meta-item"><span>Branch</span><strong id="branchName">—</strong></div>
+                                <div class="meta-item"><span>Stack</span><strong id="stackName">—</strong></div>
+                                <div class="meta-item"><span>Started</span><strong id="startTime">—</strong></div>
+                                <div class="meta-item"><span>Duration</span><strong id="duration">—</strong></div>
+                                <div class="meta-item" style="grid-column: span 2;">
+                                    <span>Public URL</span>
+                                    <div class="public-row">
+                                        <a id="publicUrl" href="#" target="_blank" rel="noreferrer">—</a>
+                                        <button id="publicCopy" class="chip" onclick="copyPublicUrl()" disabled>Copy</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="progress-section">
+                            <div class="progress-header"><span class="progress-label">Completion</span><span id="progressPercent" class="progress-value">0%</span></div>
+                            <div class="progress-bar"><div id="progressFill" class="progress-fill" style="width: 0%"></div></div>
+                        </div>
+                        <div class="stats-grid">
+                            <div class="stat-card"><div id="statDone" class="stat-value">0</div><div class="stat-label">Done</div></div>
+                            <div class="stat-card"><div id="statRunning" class="stat-value">0</div><div class="stat-label">Running</div></div>
+                            <div class="stat-card"><div id="statPending" class="stat-value">0</div><div class="stat-label">Pending</div></div>
+                            <div class="stat-card"><div id="statFailed" class="stat-value">0</div><div class="stat-label">Failed</div></div>
+                        </div>
+                    </div>
+                </div>
+                <div id="currentStoryCard" class="card" style="margin-bottom: 20px; display: none;">
+                    <div class="card-header"><h2>Current Story</h2><span class="status-subtle">Active</span></div>
+                    <div class="card-body">
+                        <div class="current-story">
+                            <div class="meta"><span id="currentStoryId">S01</span> · <span id="currentStoryTries">Attempt 1</span></div>
+                            <div id="currentStoryTitle" style="font-size: 16px; margin: 8px 0 12px;">—</div>
+                            <div id="currentStoryCriteria" style="font-size: 12px; color: rgba(255,255,255,0.8);"></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="card" style="margin-bottom: 20px;">
+                    <div class="card-header"><h2>Live Agent Stream</h2><button class="chip" onclick="clearAi()">Clear</button></div>
+                    <div id="aiContainer" class="stream"></div>
+                </div>
+                <div class="card">
+                    <div class="card-header"><h2>System Logs</h2><button class="chip" onclick="clearLogs()">Clear</button></div>
+                    <div id="logsContainer" class="logs-container"></div>
+                </div>
+            </div>
+            <div class="sidebar">
+                <div class="card">
+                    <div class="card-header"><h2>Stories</h2><span id="storiesCount" class="status-subtle">0 stories</span></div>
+                    <div id="storiesList" class="stories-list"><div class="empty-state">No stories yet</div></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div id="connectionStatus" class="connection-status disconnected">Stream: Disconnected</div>
+    <script>
+        let state={status:'idle',feature:'',branch:'',stack:'',iteration:0,startTime:null,stories:[],currentStory:null,publicUrl:''};
+        let eventSource=null,durationInterval=null;
+        function connect(){if(eventSource)eventSource.close();eventSource=new EventSource('/events');eventSource.onopen=()=>{updateConnectionStatus(true);addLog('info','Connected')};eventSource.onerror=()=>{updateConnectionStatus(false);setTimeout(connect,3000)};eventSource.onmessage=(e)=>{try{handleEvent(JSON.parse(e.data))}catch(err){}}}
+        function handleEvent(e){switch(e.type){case'init':state.feature=e.feature||'';state.branch=e.branch||'';state.stack=e.stack||'';state.stories=(e.stories||[]).map(s=>({...s,status:'pending'}));state.startTime=new Date();startDurationTimer();updateUI();break;case'status':state.status=e.status;updateStatusBadge();break;case'iteration':state.iteration=e.iteration;document.getElementById('iteration').textContent='Iteration '+e.iteration;break;case'story_start':state.currentStory=e.story;state.stories=state.stories.map(s=>s.id===e.story.id?{...s,status:'running'}:s);updateUI();addLog('info','Starting '+e.story.id+': '+e.story.title);break;case'story_done':state.currentStory=null;state.stories=state.stories.map(s=>s.id===e.id?{...s,status:'done',done:true}:s);updateUI();addLog('info','Completed '+e.id);break;case'story_failed':state.stories=state.stories.map(s=>s.id===e.id?{...s,tries:e.tries,status:e.tries>=3?'failed':'pending'}:s);updateUI();addLog('info','Failed '+e.id+' (attempt '+e.tries+')');break;case'story_blocked':state.currentStory=null;state.stories=state.stories.map(s=>s.id===e.id?{...s,status:'blocked',blocked:true}:s);updateUI();addLog('info','Blocked '+e.id);break;case'verify_result':addLog('info',(e.passed?'OK ':'FAIL ')+e.check);break;case'complete':state.status='complete';state.currentStory=null;updateUI();addLog('info','All stories complete');break;case'error':state.status='error';updateUI();addLog('info','Error: '+e.message);break;case'log':addLog(e.level||'info',e.message);break;case'ai':addAi(e.id||'',e.line||'');break;case'public_url':state.publicUrl=e.url||'';updatePublicUrl();break}}
+        function escapeHtml(value){return String(value).replace(/[&<>"']/g,(m)=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
+        function updateUI(){document.getElementById('featureName').textContent=state.feature||'—';document.getElementById('branchName').textContent=state.branch||'—';document.getElementById('stackName').textContent=state.stack||'—';document.getElementById('startTime').textContent=state.startTime?state.startTime.toLocaleTimeString():'—';const done=state.stories.filter(s=>s.done).length,running=state.stories.filter(s=>s.status==='running').length,failed=state.stories.filter(s=>s.status==='failed'||s.blocked).length,pending=state.stories.length-done-running-failed;document.getElementById('statDone').textContent=done;document.getElementById('statRunning').textContent=running;document.getElementById('statPending').textContent=pending;document.getElementById('statFailed').textContent=failed;const total=state.stories.length||1,percent=Math.round((done/total)*100);document.getElementById('progressPercent').textContent=percent+'%';document.getElementById('progressFill').style.width=percent+'%';updateStoriesList();updateCurrentStory();updateStatusBadge();updatePublicUrl()}
+        function updateStoriesList(){const c=document.getElementById('storiesList');if(!state.stories.length){c.innerHTML='<div class="empty-state">No stories yet</div>';document.getElementById('storiesCount').textContent='0 stories';return}document.getElementById('storiesCount').textContent=state.stories.length+' stories';c.innerHTML=state.stories.map(s=>{let i='○';if(s.done){i='✓'}else if(s.status==='running'){i='▶'}else if(s.blocked){i='!'}else if(s.status==='failed'){i='✗'}const act=state.currentStory?.id===s.id;const id=escapeHtml(s.id||'');const title=escapeHtml(s.title||'');const tries=s.tries>0?s.tries+' tries':'';return'<div class="story-item'+(act?' active':'')+'"><div class="story-icon">'+i+'</div><div class="story-info"><div class="story-id">'+id+'</div><div class="story-title">'+title+'</div></div><div class="story-meta">'+tries+'</div></div>'}).join('')}
+        function updateCurrentStory(){const c=document.getElementById('currentStoryCard');if(!state.currentStory){c.style.display='none';return}c.style.display='block';document.getElementById('currentStoryId').textContent=state.currentStory.id;document.getElementById('currentStoryTitle').textContent=state.currentStory.title;document.getElementById('currentStoryTries').textContent='Attempt '+((state.currentStory.tries||0)+1);document.getElementById('currentStoryCriteria').innerHTML=(state.currentStory.criteria||[]).map(c=>'<div style="display:flex;align-items:center;gap:6px;padding:4px 0;"><span>○</span><span>'+escapeHtml(c)+'</span></div>').join('')}
+        function updateStatusBadge(){const b=document.getElementById('statusBadge');const l={idle:'Idle',running:'Running',complete:'Complete',error:'Error'};const label=l[state.status]||state.status;b.className='status-badge '+state.status;b.innerHTML='<span class="status-dot"></span><span>'+label+'</span>';const agent=document.getElementById('agentState');if(agent){agent.textContent=state.status==='running'?'Agent: On':state.status==='idle'?'Agent: Off':'Agent: '+label}}
+        function updateConnectionStatus(c){const e=document.getElementById('connectionStatus');e.className='connection-status '+(c?'connected':'disconnected');e.textContent=c?'Stream: Connected':'Stream: Disconnected'}
+        function updatePublicUrl(){const link=document.getElementById('publicUrl');const btn=document.getElementById('publicCopy');if(!link||!btn)return;if(state.publicUrl){link.textContent=state.publicUrl;link.href=state.publicUrl;btn.disabled=false;}else{link.textContent='—';link.href='#';btn.disabled=true;}}
+        function copyPublicUrl(){if(!state.publicUrl)return;try{navigator.clipboard.writeText(state.publicUrl);addLog('info','Public URL copied');}catch(e){addLog('info','Copy failed');}}
+        function addAi(id,line){const c=document.getElementById('aiContainer');if(!c)return;const e=document.createElement('div');e.className='ai-line';const label=id?escapeHtml(id):'AI';e.innerHTML='<span class="ai-id">'+label+'</span><span class="ai-text">'+escapeHtml(line)+'</span>';c.appendChild(e);c.scrollTop=c.scrollHeight;while(c.children.length>800)c.removeChild(c.firstChild)}
+        function addLog(l,m){const c=document.getElementById('logsContainer'),t=new Date().toLocaleTimeString(),e=document.createElement('div');e.className='log-entry';e.innerHTML='<span class="log-time">'+t+'</span><span class="log-msg">'+escapeHtml(m)+'</span>';c.appendChild(e);c.scrollTop=c.scrollHeight;while(c.children.length>500)c.removeChild(c.firstChild)}
+        function clearLogs(){document.getElementById('logsContainer').innerHTML=''}
+        function clearAi(){document.getElementById('aiContainer').innerHTML=''}
+        function startDurationTimer(){if(durationInterval)clearInterval(durationInterval);durationInterval=setInterval(()=>{if(!state.startTime)return;const d=Math.floor((Date.now()-state.startTime.getTime())/1000),m=Math.floor(d/60),s=d%60;document.getElementById('duration').textContent=m+'m '+s+'s'},1000)}
+        connect();
+    </script>
+</body>
+</html>
+DASHBOARD_EOF
+)
+
+    local server_script="$RALPH_DIR/dashboard_server.py"
+    cat > "$server_script" << PYEOF
+import http.server, socketserver, os, sys, threading, time
+from pathlib import Path
+from urllib.parse import urlparse
+
+PORT = int(os.environ.get("RALPH_DASHBOARD_PORT", $RALPH_DASHBOARD_PORT))
+HOST = "$RALPH_DASHBOARD_HOST"
+EVENTS_FILE = "$EVENTS_FILE"
+
+clients = []
+clients_lock = threading.Lock()
+
+DASHBOARD_HTML = '''$dashboard_html'''
+
+class Watcher(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.last_pos = 0
+    def run(self):
+        while True:
+            try:
+                if os.path.exists(EVENTS_FILE):
+                    if os.path.getsize(EVENTS_FILE) < self.last_pos:
+                        self.last_pos = 0
+                    with open(EVENTS_FILE) as f:
+                        f.seek(self.last_pos)
+                        for line in f:
+                            if line.strip():
+                                broadcast(line.strip())
+                        self.last_pos = f.tell()
+            except Exception:
+                pass
+            time.sleep(0.1)
+
+def broadcast(data):
+    with clients_lock:
+        dead = []
+        for c in clients:
+            try:
+                c.wfile.write(f"data: {data}\\n\\n".encode())
+                c.wfile.flush()
+            except Exception:
+                dead.append(c)
+        for d in dead:
+            if d in clients:
+                clients.remove(d)
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path in ('/', '/index.html'):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(DASHBOARD_HTML.encode())
+        elif path == '/events':
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            with clients_lock:
+                clients.append(self)
+            try:
+                while True:
+                    time.sleep(1)
+                    self.wfile.write(b": keepalive\\n\\n")
+                    self.wfile.flush()
+            except Exception:
+                pass
+            finally:
+                with clients_lock:
+                    if self in clients:
+                        clients.remove(self)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+Path(EVENTS_FILE).parent.mkdir(parents=True, exist_ok=True)
+Path(EVENTS_FILE).touch()
+Watcher().start()
+with ThreadingTCPServer((HOST, PORT), Handler) as h:
+    print(f"Dashboard: http://localhost:{PORT}", flush=True)
+    h.serve_forever()
+PYEOF
+
+    python3 "$server_script" &>/dev/null &
+    DASHBOARD_PID=$!
+    CLEANUP_TASKS+=("kill $DASHBOARD_PID 2>/dev/null")
+
+    sleep 0.5
+
+    if ! kill -0 "$DASHBOARD_PID" 2>/dev/null; then
+        warn "Dashboard failed to start on port $RALPH_DASHBOARD_PORT"
+        DASHBOARD_PID=""
+        return 1
+    fi
+
+    local url
+    url=$(dashboard_url)
+    info "Dashboard: ${BOLD}$url${RESET}"
+    open_browser "$url"
+
+    start_public_tunnel || true
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# Stack Detection
+#───────────────────────────────────────────────────────────────────────────────
+STACK="" PKG_MGR=""
+TYPE_CMD="" TEST_CMD="" LINT_CMD="" BUILD_CMD="" FMT_CMD=""
+
+detect_stack() {
+    STACK="unknown"
+
+    if [[ -f package.json ]]; then
+        STACK="node"
+        [[ -f bun.lockb ]] && PKG_MGR="bun"
+        [[ -f pnpm-lock.yaml ]] && PKG_MGR="pnpm"
+        [[ -f yarn.lock ]] && PKG_MGR="yarn"
+        : "${PKG_MGR:=npm}"
+
+        local run="$PKG_MGR run"
+        [[ "$PKG_MGR" == "bun" ]] && run="bun run"
+
+        jq -e '.scripts.test' package.json &>/dev/null && TEST_CMD="$run test"
+        jq -e '.scripts.typecheck' package.json &>/dev/null && TYPE_CMD="$run typecheck"
+        jq -e '.scripts.lint' package.json &>/dev/null && LINT_CMD="$run lint"
+        jq -e '.scripts.build' package.json &>/dev/null && BUILD_CMD="$run build"
+        jq -e '.scripts.format' package.json &>/dev/null && FMT_CMD="$run format"
+
+        [[ -z "$TYPE_CMD" && -f tsconfig.json ]] && TYPE_CMD="npx tsc --noEmit"
+        [[ -z "$TEST_CMD" ]] && {
+            [[ -d node_modules/vitest ]] && TEST_CMD="npx vitest run"
+            [[ -d node_modules/jest ]] && TEST_CMD="npx jest --passWithNoTests"
+        }
+        [[ -z "$LINT_CMD" && -f .eslintrc* ]] && LINT_CMD="npx eslint . --max-warnings=0"
+
+    elif [[ -f pyproject.toml || -f setup.py || -f requirements.txt ]]; then
+        STACK="python"
+        [[ -f poetry.lock ]] && PKG_MGR="poetry"
+        [[ -f Pipfile.lock ]] && PKG_MGR="pipenv"
+        [[ -f uv.lock ]] && PKG_MGR="uv"
+        : "${PKG_MGR:=pip}"
+
+        command -v pytest &>/dev/null && TEST_CMD="pytest -q"
+        command -v mypy &>/dev/null && TYPE_CMD="mypy ."
+        command -v ruff &>/dev/null && { LINT_CMD="ruff check ."; FMT_CMD="ruff format --check ."; }
+        command -v black &>/dev/null && : "${FMT_CMD:=black --check .}"
+
+    elif [[ -f Cargo.toml ]]; then
+        STACK="rust"
+        PKG_MGR="cargo"
+        TEST_CMD="cargo test --quiet"
+        TYPE_CMD="cargo check --quiet"
+        LINT_CMD="cargo clippy --quiet -- -D warnings"
+        BUILD_CMD="cargo build --quiet"
+        FMT_CMD="cargo fmt --check"
+
+    elif [[ -f go.mod ]]; then
+        STACK="go"
+        PKG_MGR="go"
+        TEST_CMD="go test ./... -count=1"
+        TYPE_CMD="go vet ./..."
+        BUILD_CMD="go build ./..."
+        command -v golangci-lint &>/dev/null && LINT_CMD="golangci-lint run"
+        command -v gofmt &>/dev/null && FMT_CMD="gofmt -l ."
+
+    elif [[ -f Gemfile ]]; then
+        STACK="ruby"
+        PKG_MGR="bundle"
+        [[ -f .rspec ]] && TEST_CMD="bundle exec rspec"
+        command -v rubocop &>/dev/null && LINT_CMD="bundle exec rubocop"
+        command -v sorbet &>/dev/null && TYPE_CMD="bundle exec srb tc"
+    fi
+
+    debug "Stack: $STACK | Pkg: $PKG_MGR | Test: ${TEST_CMD:-none} | Type: ${TYPE_CMD:-none}"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# Codebase Analysis
+#───────────────────────────────────────────────────────────────────────────────
+analyze_codebase() {
+    local output=""
+    local files=""
+
+    if command -v rg &>/dev/null; then
+        files=$(rg --files \
+            -g "*.ts" -g "*.tsx" -g "*.js" -g "*.jsx" -g "*.py" -g "*.go" -g "*.rs" -g "*.rb" \
+            -g "!**/node_modules/**" -g "!**/.git/**" -g "!**/dist/**" -g "!**/build/**" \
+            -g "!**/__pycache__/**" -g "!**/.venv/**" -g "!**/target/**" -g "!**/.ralph/**" \
+            -g "!**/vendor/**" | head -50)
+    else
+        files=$(find . -type f \( \
+            -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \
+            -o -name "*.py" -o -name "*.go" -o -name "*.rs" -o -name "*.rb" \
+            \) ! -path "*/node_modules/*" ! -path "*/.git/*" ! -path "*/dist/*" \
+            ! -path "*/build/*" ! -path "*/__pycache__/*" ! -path "*/.venv/*" \
+            ! -path "*/target/*" ! -path "*/.ralph/*" ! -path "*/vendor/*" \
+            2>/dev/null | sort | head -50)
+    fi
+
+    output+="## Project Structure\n\`\`\`\n$files\n\`\`\`\n\n"
+
+    if [[ -f package.json ]]; then
+        output+="## Dependencies\n\`\`\`json\n"
+        output+=$(jq '{ dependencies: (.dependencies // {} | keys[:15]), devDependencies: (.devDependencies // {} | keys[:10]) }' package.json 2>/dev/null)
+        output+="\n\`\`\`\n\n"
+    elif [[ -f pyproject.toml ]]; then
+        output+="## Dependencies (pyproject.toml)\n\`\`\`toml\n"
+        output+=$(head -40 pyproject.toml)
+        output+="\n\`\`\`\n\n"
+    elif [[ -f Cargo.toml ]]; then
+        output+="## Dependencies (Cargo.toml)\n\`\`\`toml\n"
+        output+=$(sed -n '/\[dependencies\]/,/^\[/p' Cargo.toml | head -30)
+        output+="\n\`\`\`\n\n"
+    fi
+
+    local schema_file=""
+    for f in prisma/schema.prisma drizzle/schema.ts src/db/schema.ts db/schema.ts schema.prisma; do
+        [[ -f "$f" ]] && schema_file="$f" && break
+    done
+    if [[ -n "$schema_file" ]]; then
+        output+="## Database Schema ($schema_file)\n\`\`\`\n"
+        output+=$(head -60 "$schema_file")
+        output+="\n\`\`\`\n\n"
+    fi
+
+    local routes=""
+    if [[ -d app/api ]] || [[ -d pages/api ]]; then
+        routes=$(find . \( -path "*/app/api/*" -o -path "*/pages/api/*" \) -name "*.ts" 2>/dev/null | head -20)
+    elif [[ -d src/routes ]] || [[ -d routes ]]; then
+        routes=$(find . \( -path "*/src/routes/*" -o -path "*/routes/*" \) \( -name "*.ts" -o -name "*.py" \) 2>/dev/null | head -20)
+    fi
+    if [[ -n "$routes" ]]; then
+        output+="## API Routes\n\`\`\`\n$routes\n\`\`\`\n\n"
+    fi
+
+    local samples=""
+    for pattern in "src/index.ts" "src/main.ts" "src/app.ts" "main.py" "app.py" "main.go" "src/main.rs"; do
+        [[ -f "$pattern" ]] && { samples+="### $pattern\n\`\`\`\n$(head -40 "$pattern")\n\`\`\`\n"; break; }
+    done
+    [[ -n "$samples" ]] && output+="## Code Patterns\n$samples\n"
+
+    printf '%b' "$output"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# PRD Management
+#───────────────────────────────────────────────────────────────────────────────
+
+generate_prd() {
+    local feature="$1"
+
+    info "Analyzing codebase..."
+    local context
+    context=$(analyze_codebase)
+
+    info "Generating implementation plan..."
+
+    local criteria_items=()
+    criteria_items+=("\"Specific verifiable criterion\"")
+    [[ -n "$TYPE_CMD" ]] && criteria_items+=("\"${TYPE_CMD%% *} passes\"")
+    [[ -n "$TEST_CMD" ]] && criteria_items+=("\"tests pass\"")
+    local criteria_block
+    criteria_block=$(IFS=$',\n        '; printf '%s' "${criteria_items[*]}")
+
+    local prompt="You are a principal software engineer. Create an implementation plan for an autonomous AI coding agent.
+
+## Feature Request
+$feature
+
+## Tech Stack
+- Language/Framework: $STACK
+- Package Manager: ${PKG_MGR:-unknown}
+- Typecheck: ${TYPE_CMD:-none}
+- Test: ${TEST_CMD:-none}
+- Lint: ${LINT_CMD:-none}
+- Format: ${FMT_CMD:-none}
+
+## Codebase
+$context
+
+## CRITICAL REQUIREMENTS
+
+### Story Atomicity
+Each story MUST be completable in a single AI context window:
+- Maximum 3 files changed
+- Maximum 150 lines added/modified
+- Single, focused responsibility
+- No external dependencies needed
+
+### Dependency Field
+Use deps to list story IDs that must be completed first.
+- deps must reference earlier story IDs only
+- use [] if no dependencies
+
+### Priority Order
+1-2: Types, interfaces, schemas (data layer)
+3-4: Core business logic, services
+5-6: API routes, handlers
+7-8: UI components, views
+9+: Integration, tests, polish
+
+### Acceptance Criteria
+Every criterion must be MECHANICALLY VERIFIABLE:
+✓ \"File src/types/user.ts exports UserType interface\"
+✓ \"Function validateEmail exists in src/utils/validation.ts\"
+✗ \"User validation works correctly\" (too vague)
+✗ \"Good error handling\" (not verifiable)
+
+## OUTPUT
+
+Return ONLY valid JSON. No markdown. No explanation. No preamble.
+
+{
+  \"feature\": \"2-4 word name\",
+  \"branch\": \"ralph/kebab-case\",
+  \"stories\": [
+    {
+      \"id\": \"S01\",
+      \"title\": \"Imperative action title\",
+      \"why\": \"Brief value explanation\",
+      \"criteria\": [
+        $criteria_block
+      ],
+      \"files\": [\"likely/affected/files.ts\"],
+      \"deps\": [],
+      \"priority\": 1
+    }
+  ]
+}"
+
+    local raw_file="$RALPH_DIR/prd.raw"
+    local prompt_file="$RALPH_DIR/prd.prompt"
+    printf '%s' "$prompt" > "$prompt_file"
+
+    local attempt
+    for attempt in 1 2 3; do
+        debug "PRD generation attempt $attempt/3"
+
+        if ! with_timeout "$RALPH_TIMEOUT" "$RALPH_CLAUDE" --print < "$prompt_file" > "$raw_file" 2>>"$LOG_FILE"; then
+            warn "Claude call failed (attempt $attempt)"
+            continue
+        fi
+
+        if json_extract < "$raw_file" > "$PRD_FILE" 2>/dev/null; then
+            jq_inplace "$PRD_FILE" '
+                .created = (now | todate) |
+                .stories = [.stories[] |
+                    . + {done: false, tries: 0, blocked: false, running: false, notes: ""}
+                ]
+            ' || continue
+
+            if jq -e '.stories | length > 0' "$PRD_FILE" &>/dev/null; then
+                local count
+                count=$(jq '.stories | length' "$PRD_FILE")
+                ok "Generated $count stories"
+                log_usage "prd" "$prompt_file" "$raw_file"
+                return 0
+            fi
+        fi
+
+        warn "Invalid PRD structure (attempt $attempt)"
+    done
+
+    die "Failed to generate valid PRD after 3 attempts. See: $raw_file"
+}
+
+validate_prd() {
+    jq -e '
+        (.feature | type == "string") and
+        (.branch | type == "string") and
+        (.stories | type == "array" and length > 0) and
+        (.stories | all(.id and .title and (.criteria | type == "array"))) and
+        (.stories | all((.deps // []) | type == "array"))
+    ' "$PRD_FILE" &>/dev/null || die "Invalid PRD structure"
+}
+
+mark_running() {
+    local id="$1"
+    jq_inplace "$PRD_FILE" --arg id "$id" --arg ts "$(date -Iseconds)" '
+        .stories |= map(if .id == $id then . + {running: true, startedAt: $ts} else . end)
+    '
+}
+
+mark_stopped() {
+    local id="$1"
+    jq_inplace "$PRD_FILE" --arg id "$id" '
+        .stories |= map(if .id == $id then . + {running: false} else . end)
+    '
+}
+
+get_next_story() {
+    jq -r --argjson max "$RALPH_MAX_TRIES" '
+        . as $root
+        | $root.stories
+        | map(select(.done == false and .blocked == false and (.running // false) == false and (.tries // 0) < $max))
+        | map(select((.deps // []) | all(. as $d | ($root.stories[] | select(.id == $d) | .done))))
+        | sort_by(.priority, .id)
+        | .[0].id // empty
+    ' "$PRD_FILE"
+}
+
+block_stories_with_blocked_deps() {
+    jq_inplace "$PRD_FILE" '
+        . as $root
+        | .stories |= map(
+            if (.done == true or .blocked == true) then .
+            else
+                (.deps // []) as $deps
+                | ($deps | map(select(. as $d | ($root.stories[] | select(.id == $d) | .blocked)))) as $blocked_deps
+                | if ($blocked_deps | length) > 0 then
+                    . + {blocked: true, notes: ("dependency blocked: " + ($blocked_deps | join(", ")))}
+                  else .
+                  end
+            end
+        )
+    '
+}
+
+mark_done() {
+    local id="$1" commit="${2:-}"
+    jq_inplace "$PRD_FILE" --arg id "$id" --arg commit "$commit" --arg ts "$(date -Iseconds)" '
+        .stories |= map(if .id == $id then . + {done: true, completedAt: $ts, commit: $commit, running: false} else . end)
+    '
+    local title total done
+    title=$(jq -r --arg id "$id" '.stories[] | select(.id == $id) | .title' "$PRD_FILE")
+    total=$(jq '.stories | length' "$PRD_FILE")
+    done=$(jq '[.stories[] | select(.done)] | length' "$PRD_FILE")
+    notify_webhook "story_done" "$id" "$title" "$total" "$done"
+    emit_event "story_done" "$id"
+}
+
+mark_try() {
+    local id="$1"
+    jq_inplace "$PRD_FILE" --arg id "$id" '
+        .stories |= map(if .id == $id then .tries = ((.tries // 0) + 1) else . end)
+    '
+}
+
+mark_failed() {
+    local id="$1"
+    local tries
+    tries=$(jq -r --arg id "$id" '.stories[] | select(.id == $id) | .tries' "$PRD_FILE")
+    emit_event "story_failed" "$id" "$tries"
+}
+
+mark_blocked() {
+    local id="$1" reason="$2"
+    jq_inplace "$PRD_FILE" --arg id "$id" --arg reason "$reason" '
+        .stories |= map(if .id == $id then . + {blocked: true, notes: $reason, running: false} else . end)
+    '
+    emit_event "story_blocked" "$id" "$reason"
+}
+
+remaining_count() {
+    jq '[.stories[] | select(.done == false and .blocked == false)] | length' "$PRD_FILE"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# Self-Healing: Story Splitting
+#───────────────────────────────────────────────────────────────────────────────
+split_story() {
+    local id="$1"
+    local story
+    story=$(jq -c --arg id "$id" '.stories[] | select(.id == $id)' "$PRD_FILE")
+
+    info "Analyzing failed story for split..."
+
+    local prompt="This story failed multiple times. Split it into 2-3 smaller stories.
+
+ORIGINAL STORY:
+$story
+
+Return ONLY JSON array of new stories:
+[{\"id\":\"${id}a\",\"title\":\"...\",\"criteria\":[...],\"priority\":...}, ...]"
+
+    local result
+    if ! result=$(printf '%s' "$prompt" | with_timeout 120 "$RALPH_CLAUDE" --print 2>/dev/null); then
+        warn "Could not split story"
+        return 1
+    fi
+
+    local new_stories
+    if ! new_stories=$(printf '%s' "$result" | json_extract 2>/dev/null); then
+        warn "Invalid split response"
+        return 1
+    fi
+
+    jq_inplace "$PRD_FILE" --arg id "$id" --argjson new "$new_stories" '
+        .stories = [.stories[] | select(.id != $id)] +
+        [$new[] | . + {done: false, tries: 0, blocked: false, running: false, notes: ""}]
+    '
+
+    ok "Split $id into $(printf '%s' "$new_stories" | jq 'length') stories"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# Verification
+#───────────────────────────────────────────────────────────────────────────────
+run_check() {
+    local label="$1" cmd="$2" mode="$3" log_file="$4" story_id="$5"
+
+    [[ -z "$cmd" ]] && return 0
+
+    printf '=== %s ===\n' "${label^^}" >> "$log_file"
+    if eval "$cmd" >> "$log_file" 2>&1; then
+        printf '  %s✓%s %s\n' "$GREEN" "$RESET" "$label"
+        emit_event "verify_result" "$story_id" "$label" "true"
+        return 0
+    fi
+
+    if [[ "$mode" == "warn" ]]; then
+        printf '  %s~%s %s (warnings)\n' "$YELLOW" "$RESET" "$label"
+        emit_event "verify_result" "$story_id" "$label" "false"
+        return 0
+    fi
+
+    printf '  %s✗%s %s\n' "$RED" "$RESET" "$label"
+    emit_event "verify_result" "$story_id" "$label" "false"
+    return 1
+}
+
+verify() {
+    ((RALPH_VERIFY == 0)) && return 0
+
+    local story_id="${1:-}"
+    local verify_log="${2:-$RALPH_DIR/last_verify.log}"
+    local pass=true
+
+    emit_event "verify_start" "$story_id"
+
+    : > "$verify_log"
+
+    if [[ -n "$TYPE_CMD" ]]; then
+        run_check "typecheck" "$TYPE_CMD" "fail" "$verify_log" "$story_id" || pass=false
+    fi
+
+    if [[ -n "$LINT_CMD" ]]; then
+        run_check "lint" "$LINT_CMD" "warn" "$verify_log" "$story_id" || true
+    fi
+
+    if [[ -n "$FMT_CMD" ]]; then
+        if [[ "$FMT_CMD" == "gofmt -l "* ]]; then
+            printf '=== FORMAT ===\n' >> "$verify_log"
+            local fmt_out
+            fmt_out=$(gofmt -l . 2>>"$verify_log" || true)
+            if [[ -z "$fmt_out" ]]; then
+                printf '  %s✓%s format\n' "$GREEN" "$RESET"
+                emit_event "verify_result" "$story_id" "format" "true"
+            else
+                printf '  %s~%s format (warnings)\n' "$YELLOW" "$RESET"
+                printf '%s\n' "$fmt_out" >> "$verify_log"
+                emit_event "verify_result" "$story_id" "format" "false"
+            fi
+        else
+            run_check "format" "$FMT_CMD" "warn" "$verify_log" "$story_id" || true
+        fi
+    fi
+
+    if [[ -n "$TEST_CMD" ]]; then
+        run_check "tests" "$TEST_CMD" "fail" "$verify_log" "$story_id" || pass=false
+    fi
+
+    $pass
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# Agent Execution
+#───────────────────────────────────────────────────────────────────────────────
+execute_story() {
+    local id="$1"
+    local story
+    story=$(jq -c --arg id "$id" '.stories[] | select(.id == $id)' "$PRD_FILE")
+    local title
+    title=$(printf '%s' "$story" | jq -r '.title')
+
+    local memory=""
+    [[ -f "$RALPH_DIR/memory.md" ]] && memory=$(tail -30 "$RALPH_DIR/memory.md")
+
+    local claude_args=()
+    ((RALPH_SAFE == 0)) && claude_args+=(--dangerously-skip-permissions)
+    [[ -n "$RALPH_MODEL" ]] && claude_args+=(--model "$RALPH_MODEL")
+
+    local tries
+    tries=$(jq -r --arg id "$id" '.stories[] | select(.id == $id) | .tries' "$PRD_FILE")
+    local attempt=$((tries > 0 ? tries - 1 : 0))
+
+    local attempt_dir="$RALPH_DIR/attempts/${id}/attempt-${tries}"
+    mkdir -p "$attempt_dir"
+
+    local commit_step="3. **Commit**: \\`git add -A && git commit -m \\\"feat($id): $title\\\"\\`"
+    local commit_fix_step="5. **Commit**: \\`git add -A && git commit -m \\\"fix($id): address verification failure\\\"\\`"
+    if ((RALPH_NO_COMMIT == 1)); then
+        commit_step="3. **Do not commit** (leave changes staged or unstaged)."
+        commit_fix_step="5. **Do not commit** (leave changes staged or unstaged)."
+    fi
+
+    local prompt=""
+    if ((attempt == 0)); then
+        prompt="# Implement: $title
+
+## Story
+$story
+
+## Stack
+- Type: $STACK
+- Typecheck: ${TYPE_CMD:-none}
+- Test: ${TEST_CMD:-none}
+- Lint: ${LINT_CMD:-none}
+- Format: ${FMT_CMD:-none}
+
+## Previous Context
+$memory
+
+## Quality Bar
+- Follow existing patterns and naming
+- Keep the diff tight; avoid unrelated refactors
+- Remove unused code and TODOs
+
+## Instructions
+
+1. **Implement** the story following acceptance criteria exactly
+2. **Verify** locally:
+   ${TYPE_CMD:+   - \`$TYPE_CMD\`}
+   ${LINT_CMD:+   - \`$LINT_CMD\`}
+   ${FMT_CMD:+   - \`$FMT_CMD\`}
+   ${TEST_CMD:+   - \`$TEST_CMD\`}
+$commit_step
+
+## Output
+
+When complete: \`RALPH_DONE:$id\`
+If blocked: \`RALPH_BLOCKED:$id:reason\`"
+    else
+        local prev_log="$RALPH_DIR/attempts/${id}/attempt-$((tries-1))/output.log"
+        local error_snippet=""
+        [[ -f "$prev_log" ]] && error_snippet=$(tail -150 "$prev_log" 2>/dev/null || echo "No previous log")
+
+        local failed_check="verification"
+        [[ -f "$RALPH_DIR/last_verify.log" ]] && {
+            grep -q "typecheck" "$RALPH_DIR/last_verify.log" 2>/dev/null && failed_check="typecheck (${TYPE_CMD:-})"
+            grep -q "tests" "$RALPH_DIR/last_verify.log" 2>/dev/null && failed_check="tests (${TEST_CMD:-})"
+        }
+
+        prompt="# Fix Failed Story: $title
+
+## Story
+$story
+
+## What Failed
+$failed_check
+
+## Error Output (last 150 lines)
+\`\`\`
+$error_snippet
+\`\`\`
+
+## Quality Bar
+- Fix only what the failure requires
+- Keep the diff tight; avoid unrelated refactors
+- Remove unused code and TODOs
+
+## Instructions
+
+1. **Analyze** the error carefully
+2. **Fix ONLY** what's necessary to pass verification
+3. **Keep diff minimal** - don't refactor unrelated code
+4. **Verify** locally before declaring done:
+   ${TYPE_CMD:+   - \`$TYPE_CMD\`}
+   ${LINT_CMD:+   - \`$LINT_CMD\`}
+   ${FMT_CMD:+   - \`$FMT_CMD\`}
+   ${TEST_CMD:+   - \`$TEST_CMD\`}
+$commit_fix_step
+
+## Output
+
+When fixed: \`RALPH_DONE:$id\`
+If blocked: \`RALPH_BLOCKED:$id:reason\`"
+    fi
+
+    local prompt_file="$attempt_dir/prompt.txt"
+    local output_file="$attempt_dir/output.log"
+    printf '%s' "$prompt" > "$prompt_file"
+
+    local cmd_status=0
+    set +e
+    if ((RALPH_STREAM_AI == 1)); then
+        printf '%s' "$prompt" | with_timeout "$RALPH_TIMEOUT" "$RALPH_CLAUDE" "${claude_args[@]}" 2>&1 | tee "$output_file" | while IFS= read -r line; do
+            [[ -n "$line" ]] || continue
+            emit_event "ai" "$id" "$line"
+        done >/dev/null
+        cmd_status=${PIPESTATUS[1]}
+    else
+        printf '%s' "$prompt" | with_timeout "$RALPH_TIMEOUT" "$RALPH_CLAUDE" "${claude_args[@]}" 2>&1 | tee "$output_file" >/dev/null
+        cmd_status=${PIPESTATUS[1]}
+    fi
+    set -e
+
+    if ((cmd_status != 0)); then
+        return 1
+    fi
+
+    log_usage "story" "$prompt_file" "$output_file"
+
+    if grep -q "RALPH_DONE:$id" "$output_file"; then
+        return 0
+    elif grep -q "RALPH_BLOCKED:$id" "$output_file"; then
+        local reason
+        reason=$(grep -o "RALPH_BLOCKED:$id:.*" "$output_file" | cut -d: -f3-)
+        if [[ -n "$reason" ]]; then
+            printf '%s' "$reason" > "$attempt_dir/blocked.reason"
+        fi
+        if [[ "${RALPH_CHILD:-0}" != "1" ]]; then
+            mark_blocked "$id" "${reason:-unknown}"
+        fi
+        return 2
+    fi
+    return 1
+}
+
+maybe_commit_changes() {
+    local id="$1" title="$2" before_head="$3"
+
+    if git diff --quiet && git diff --cached --quiet; then
+        return 0
+    fi
+
+    ((RALPH_NO_COMMIT == 1)) && { warn "Uncommitted changes for $id (auto-commit disabled)"; return 0; }
+
+    git add -A
+
+    local current_head
+    current_head=$(git rev-parse HEAD 2>/dev/null || echo "")
+    local msg="feat($id): $title"
+    [[ -n "$before_head" && "$current_head" != "$before_head" ]] && msg="chore($id): capture uncommitted changes"
+
+    git commit -m "$msg" --no-verify &>/dev/null || true
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# PR Summary Generation
+#───────────────────────────────────────────────────────────────────────────────
+generate_pr_summary() {
+    local base_sha="$1"
+    local summary_file="$RALPH_DIR/pr_summary.md"
+
+    info "Generating PR summary..."
+
+    if ! git rev-parse "$base_sha" &>/dev/null; then
+        warn "Base SHA not found, skipping PR summary"
+        return 1
+    fi
+
+    local git_log git_diffstat feature branch
+    git_log=$(git log --oneline "${base_sha}..HEAD" 2>/dev/null || echo "No commits")
+    git_diffstat=$(git diff --stat "${base_sha}..HEAD" 2>/dev/null || echo "No changes")
+    feature=$(jq -r '.feature // "unknown"' "$PRD_FILE")
+    branch=$(jq -r '.branch // "unknown"' "$PRD_FILE")
+
+    local prompt="Create a PR description in Markdown. Be concise and useful.
+
+## Context
+- Feature: $feature
+- Branch: $branch
+
+## Commits
+$git_log
+
+## Diffstat
+$git_diffstat
+
+## Format Required
+- Title (one line)
+- Summary (2-3 sentences)
+- Changes (bullet points)
+- How to test (commands)
+- Notes/risks (if any)"
+
+    local prompt_file="$RALPH_DIR/pr_summary.prompt"
+    local output_file="$RALPH_DIR/pr_summary.raw"
+    printf '%s' "$prompt" > "$prompt_file"
+
+    if with_timeout "$RALPH_TIMEOUT" "$RALPH_CLAUDE" --print < "$prompt_file" > "$output_file" 2>/dev/null; then
+        mv "$output_file" "$summary_file"
+        ok "PR summary: $summary_file"
+        emit_event "log" "info" "PR summary generated"
+        log_usage "pr_summary" "$prompt_file" "$summary_file"
+    else
+        warn "Could not generate PR summary"
+    fi
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# Progress Display
+#───────────────────────────────────────────────────────────────────────────────
+show_progress() {
+    local iter="$1"
+    local total done blocked
+    total=$(jq '.stories | length' "$PRD_FILE")
+    done=$(jq '[.stories[] | select(.done)] | length' "$PRD_FILE")
+    blocked=$(jq '[.stories[] | select(.blocked)] | length' "$PRD_FILE")
+
+    local pct=0
+    if ((total > 0)); then
+        pct=$((done * 100 / total))
+    fi
+    local width=50
+    local filled=$((pct * width / 100))
+
+    printf '\n%s' "$CLEAR_LINE"
+    printf '%s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n' "$DIM" "$RESET"
+    printf '%sIteration %d%s │ ' "$BOLD" "$iter" "$RESET"
+    printf '%s%d%s/%d done' "$GREEN" "$done" "$RESET" "$total"
+    ((blocked > 0)) && printf ' │ %s%d blocked%s' "$RED" "$blocked" "$RESET"
+    printf '\n'
+
+    printf '['
+    printf '%s%*s%s' "$GREEN" "$filled" '' "$RESET" | tr ' ' '█'
+    printf '%s%*s%s' "$DIM" "$((width - filled))" '' "$RESET" | tr ' ' '░'
+    printf '] %d%%\n' "$pct"
+    printf '%s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n' "$DIM" "$RESET"
+}
+
+show_stories() {
+    jq -r '.stories[] |
+        if .running then "\u001b[34m▶\u001b[0m \(.id) \u001b[2m\(.title)\u001b[0m"
+        elif .done then "\u001b[32m✓\u001b[0m \(.id) \u001b[2m\(.title)\u001b[0m"
+        elif .blocked then "\u001b[31m✗\u001b[0m \(.id) \(.title) \u001b[31m(blocked)\u001b[0m"
+        elif .tries > 0 then "\u001b[33m◐\u001b[0m \(.id) \(.title) \u001b[33m(\(.tries) tries)\u001b[0m"
+        else "\u001b[90m○\u001b[0m \(.id) \(.title)" end
+    ' "$PRD_FILE"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# Worktree Helpers
+#───────────────────────────────────────────────────────────────────────────────
+ensure_worktree_root() {
+    local repo_name
+    repo_name=$(basename "$RALPH_ROOT")
+    WORKTREE_ROOT="$RALPH_WORKTREE_ROOT/$repo_name"
+    mkdir -p "$WORKTREE_ROOT"
+}
+
+load_session_worktree() {
+    SESSION_WORKTREE=""
+    SESSION_BRANCH=""
+    [[ -f "$SESSION_FILE" ]] || return 1
+    SESSION_WORKTREE=$(jq -r '.worktree_path // ""' "$SESSION_FILE")
+    SESSION_BRANCH=$(jq -r '.worktree_branch // ""' "$SESSION_FILE")
+    [[ -n "$SESSION_WORKTREE" && -d "$SESSION_WORKTREE" ]] || return 1
+    git -C "$SESSION_WORKTREE" rev-parse --is-inside-work-tree &>/dev/null || return 1
+    return 0
+}
+
+save_session_worktree() {
+    local path="$1" branch="$2"
+    jq -nc --arg path "$path" --arg branch "$branch" --arg ts "$(date -Iseconds)" \
+        '{worktree_path:$path, worktree_branch:$branch, created_at:$ts}' > "$SESSION_FILE"
+}
+
+cleanup_session_worktree() {
+    [[ -n "$SESSION_FILE" && -f "$SESSION_FILE" ]] || return 0
+    ensure_worktree_root
+
+    local path branch real_path
+    path=$(jq -r '.worktree_path // ""' "$SESSION_FILE")
+    branch=$(jq -r '.worktree_branch // ""' "$SESSION_FILE")
+
+    if [[ -n "$path" && -d "$path" ]]; then
+        real_path=$(cd "$path" 2>/dev/null && pwd -P || echo "")
+        if [[ -n "$real_path" && "$real_path" == "$WORKTREE_ROOT/"* ]]; then
+            git worktree remove -f "$real_path" &>/dev/null || true
+        fi
+    fi
+
+    if [[ -n "$branch" && "$branch" == ralph/* ]]; then
+        git branch -D "$branch" &>/dev/null || true
+    fi
+
+    rm -f "$SESSION_FILE"
+}
+
+enter_session_worktree() {
+    local branch="$1"
+    local base_sha="$2"
+
+    ensure_worktree_root
+
+    if load_session_worktree; then
+        local current_branch
+        current_branch=$(git -C "$SESSION_WORKTREE" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+        if [[ -z "$current_branch" || "$SESSION_BRANCH" == "$current_branch" ]]; then
+            info "Using session worktree: $SESSION_WORKTREE"
+            cd "$SESSION_WORKTREE"
+            return 0
+        fi
+        warn "Session worktree branch mismatch; creating new worktree"
+    fi
+
+    local safe_branch path
+    safe_branch=$(slugify "$branch")
+    path="$WORKTREE_ROOT/session-$safe_branch"
+
+    if [[ -d "$path" ]]; then
+        if git -C "$path" rev-parse --is-inside-work-tree &>/dev/null; then
+            local existing_branch
+            existing_branch=$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+            if [[ "$existing_branch" == "$branch" ]]; then
+                save_session_worktree "$path" "$branch"
+                info "Using existing worktree: $path"
+                cd "$path"
+                return 0
+            fi
+        fi
+        path="$WORKTREE_ROOT/session-${safe_branch}-$(date +%s)"
+    fi
+
+    if git worktree add -b "$branch" "$path" "$base_sha" &>/dev/null || \
+        git worktree add "$path" "$branch" &>/dev/null; then
+        save_session_worktree "$path" "$branch"
+        info "Created session worktree: $path"
+        cd "$path"
+        return 0
+    fi
+
+    warn "Failed to create session worktree; continuing without isolation"
+    return 1
+}
+
+create_story_worktree() {
+    local id="$1" base_sha="$2"
+    local safe_id
+    safe_id=$(slugify "$id")
+    local ts
+    ts=$(date +%s)
+    local rand=$RANDOM
+    local branch="ralph/tmp-${safe_id}-${ts}-${rand}"
+    local path="$WORKTREE_ROOT/${safe_id}-${ts}-${rand}"
+
+    git worktree add -b "$branch" "$path" "$base_sha" &>/dev/null || return 1
+    printf '%s|%s' "$path" "$branch"
+}
+
+cleanup_story_worktree() {
+    local path="$1" branch="$2"
+
+    git worktree remove -f "$path" &>/dev/null || true
+    git branch -D "$branch" &>/dev/null || true
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# Parallel Job Handling
+#───────────────────────────────────────────────────────────────────────────────
+run_story_job() {
+    local id="$1" worktree="$2" branch="$3" base_sha="$4" result_file="$5"
+    local status="failed" reason="" head_sha="" commits="[]" title=""
+
+    {
+        cd "$worktree"
+        title=$(jq -r --arg id "$id" '.stories[] | select(.id == $id) | .title' "$PRD_FILE")
+        local tries
+        tries=$(jq -r --arg id "$id" '.stories[] | select(.id == $id) | .tries' "$PRD_FILE")
+
+        local result=0
+        RALPH_CHILD=1 execute_story "$id" || result=$?
+
+        if ((result == 0)); then
+            local verify_log="$RALPH_DIR/attempts/${id}/attempt-${tries}/verify.log"
+            if verify "$id" "$verify_log"; then
+                maybe_commit_changes "$id" "$title" "$base_sha"
+                status="done"
+            else
+                status="failed"
+                reason="verification failed"
+            fi
+        elif ((result == 2)); then
+            status="blocked"
+            local reason_file="$RALPH_DIR/attempts/${id}/attempt-${tries}/blocked.reason"
+            if [[ -f "$reason_file" ]]; then
+                reason=$(cat "$reason_file")
+            else
+                reason="blocked"
+            fi
+        else
+            status="failed"
+            reason="incomplete"
+        fi
+
+        head_sha=$(git rev-parse HEAD 2>/dev/null || echo "")
+        if [[ -n "$base_sha" && -n "$head_sha" && "$base_sha" != "$head_sha" ]]; then
+            commits=$(git rev-list --reverse "$base_sha..$head_sha" | jq -R -s -c 'split("\n")[:-1]')
+        fi
+
+        jq -nc \
+            --arg id "$id" \
+            --arg status "$status" \
+            --arg reason "$reason" \
+            --arg base "$base_sha" \
+            --arg head "$head_sha" \
+            --arg branch "$branch" \
+            --arg path "$worktree" \
+            --argjson commits "$commits" \
+            '{id:$id, status:$status, reason:$reason, base:$base, head:$head, branch:$branch, path:$path, commits:$commits}' \
+            > "$result_file"
+    } || {
+        jq -nc \
+            --arg id "$id" \
+            --arg status "failed" \
+            --arg reason "job crashed" \
+            --arg branch "$branch" \
+            --arg path "$worktree" \
+            '{id:$id, status:$status, reason:$reason, branch:$branch, path:$path, commits:[]}' \
+            > "$result_file"
+    }
+}
+
+handle_job_result() {
+    local result_file="$1"
+
+    local id status reason branch path
+    id=$(jq -r '.id' "$result_file")
+    status=$(jq -r '.status' "$result_file")
+    reason=$(jq -r '.reason // ""' "$result_file")
+    branch=$(jq -r '.branch // ""' "$result_file")
+    path=$(jq -r '.path // ""' "$result_file")
+    local title
+    title=$(jq -r --arg id "$id" '.stories[] | select(.id == $id) | .title' "$PRD_FILE")
+
+    mark_stopped "$id"
+
+    local handled_status="$status"
+    local fail_note="$reason"
+
+    if [[ "$status" == "done" ]]; then
+        local commits
+        commits=$(jq -r '.commits[]?' "$result_file")
+        if [[ -z "$commits" ]]; then
+            warn "No commits produced for $id"
+            mark_failed "$id"
+            handled_status="failed"
+            fail_note="no commits"
+        else
+            local failed_pick=0
+            local sha
+            for sha in $commits; do
+                if ! git cherry-pick "$sha" &>/dev/null; then
+                    failed_pick=1
+                    git cherry-pick --abort &>/dev/null || true
+                    break
+                fi
+            done
+
+            if ((failed_pick)); then
+                warn "Cherry-pick conflict for $id"
+                mark_blocked "$id" "cherry-pick conflict"
+                handled_status="blocked"
+            else
+                local commit
+                commit=$(git rev-parse HEAD 2>/dev/null || echo "")
+                mark_done "$id" "$commit"
+                handled_status="done"
+            fi
+        fi
+    elif [[ "$status" == "blocked" ]]; then
+        mark_blocked "$id" "${reason:-blocked}"
+        handled_status="blocked"
+    else
+        mark_failed "$id"
+        handled_status="failed"
+    fi
+
+    if [[ "$handled_status" == "done" ]]; then
+        printf '%s\n' "- [OK] $id: $title" >> "$RALPH_DIR/memory.md"
+        PARALLEL_FAILS=0
+    elif [[ "$handled_status" == "blocked" ]]; then
+        PARALLEL_FAILS=0
+    else
+        local fail_tries
+        fail_tries=$(jq -r --arg id "$id" '.stories[] | select(.id == $id) | .tries' "$PRD_FILE")
+        notify_webhook "story_failed" "$id" "$title" "$fail_tries"
+        printf '%s\n' "- [FAIL] $id: ${fail_note:-failed}" >> "$RALPH_DIR/memory.md"
+        PARALLEL_FAILS=$((PARALLEL_FAILS + 1))
+        ((fail_tries >= RALPH_MAX_TRIES)) && split_story "$id"
+    fi
+
+    if [[ -n "$path" && -n "$branch" ]]; then
+        cleanup_story_worktree "$path" "$branch"
+    fi
+
+    rm -f "$result_file"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# Main Loop (Sequential)
+#───────────────────────────────────────────────────────────────────────────────
+run_loop_sequential() {
+    local fails=0
+    local base_sha
+    base_sha=$(git rev-parse HEAD 2>/dev/null || echo "")
+
+    local stories_json feature branch
+    stories_json=$(jq -c '[.stories[] | {id, title, criteria, priority, done, tries: (.tries // 0)}]' "$PRD_FILE")
+    feature=$(jq -r '.feature // ""' "$PRD_FILE")
+    branch=$(jq -r '.branch // ""' "$PRD_FILE")
+    emit_event "init" "$feature" "$branch" "$STACK" "$stories_json"
+    emit_event "status" "running"
+
+    for iter in $(seq 1 "$RALPH_MAX_ITER"); do
+        emit_event "iteration" "$iter"
+
+        block_stories_with_blocked_deps
+
+        local remaining
+        remaining=$(remaining_count)
+
+        if ((remaining == 0)); then
+            local total done
+            total=$(jq '.stories | length' "$PRD_FILE")
+            done=$(jq '[.stories[] | select(.done)] | length' "$PRD_FILE")
+
+            if ((done == total)); then
+                printf '\n%s' "$GREEN"
+                printf '╔═══════════════════════════════════════════════════════════╗\n'
+                printf '║                  🎉 ALL STORIES COMPLETE!                 ║\n'
+                printf '╚═══════════════════════════════════════════════════════════╝\n'
+                printf '%s\n' "$RESET"
+                local duration="$((SECONDS / 60))m $((SECONDS % 60))s"
+                notify_webhook "complete" "$total" "$duration"
+                emit_event "complete"
+                emit_event "status" "complete"
+
+                [[ -n "$base_sha" ]] && generate_pr_summary "$base_sha"
+
+                return 0
+            fi
+
+            warn "Some stories blocked"
+            show_stories
+            emit_event "status" "error"
+            return 1
+        fi
+
+        show_progress "$iter"
+
+        local next
+        next=$(get_next_story)
+        [[ -z "$next" ]] && { warn "No actionable stories"; emit_event "status" "error"; return 1; }
+
+        local title tries story_json
+        title=$(jq -r --arg id "$next" '.stories[] | select(.id == $id) | .title' "$PRD_FILE")
+        tries=$(jq -r --arg id "$next" '.stories[] | select(.id == $id) | .tries' "$PRD_FILE")
+        story_json=$(jq -c --arg id "$next" '.stories[] | select(.id == $id) | {id, title, criteria, tries}' "$PRD_FILE")
+
+        printf '%s→%s %s%s%s: %s' "$CYAN" "$RESET" "$BOLD" "$next" "$RESET" "$title"
+        ((tries > 0)) && printf ' %s(attempt %d)%s' "$YELLOW" "$((tries + 1))" "$RESET"
+        printf '\n\n'
+
+        emit_event "story_start" "$story_json"
+        mark_running "$next"
+        mark_try "$next"
+
+        local before_head
+        before_head=$(git rev-parse HEAD 2>/dev/null || echo "")
+
+        local result=0
+        execute_story "$next" || result=$?
+
+        if ((result == 0)); then
+            printf '\n%sVerifying...%s\n' "$BOLD" "$RESET"
+            if verify "$next"; then
+                ok "Story $next complete"
+
+                maybe_commit_changes "$next" "$title" "$before_head"
+
+                local commit
+                commit=$(git rev-parse HEAD 2>/dev/null || echo "")
+                mark_done "$next" "$commit"
+
+                printf '%s\n' "- [OK] $next: $title" >> "$RALPH_DIR/memory.md"
+                fails=0
+            else
+                warn "Verification failed"
+                mark_failed "$next"
+                local fail_tries
+                fail_tries=$(jq -r --arg id "$next" '.stories[] | select(.id == $id) | .tries' "$PRD_FILE")
+                notify_webhook "story_failed" "$next" "$title" "$fail_tries"
+                printf '%s\n' "- [FAIL] $next: verify failed" >> "$RALPH_DIR/memory.md"
+                ((fails++))
+
+                ((fail_tries >= RALPH_MAX_TRIES)) && split_story "$next"
+            fi
+        elif ((result == 2)); then
+            warn "Story blocked"
+            fails=0
+        else
+            warn "Story incomplete"
+            printf '%s\n' "- [FAIL] $next: incomplete" >> "$RALPH_DIR/memory.md"
+            ((fails++))
+        fi
+
+        mark_stopped "$next"
+        ((fails >= 5)) && { err "Too many consecutive failures"; emit_event "status" "error"; return 1; }
+
+        show_stories
+        sleep 1
+    done
+
+    warn "Max iterations reached"
+    emit_event "status" "error"
+    return 1
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# Main Loop (Parallel)
+#───────────────────────────────────────────────────────────────────────────────
+run_loop_parallel() {
+    local base_sha
+    base_sha=$(git rev-parse HEAD 2>/dev/null || echo "")
+    PARALLEL_FAILS=0
+
+    local stories_json feature branch
+    stories_json=$(jq -c '[.stories[] | {id, title, criteria, priority, done, tries: (.tries // 0)}]' "$PRD_FILE")
+    feature=$(jq -r '.feature // ""' "$PRD_FILE")
+    branch=$(jq -r '.branch // ""' "$PRD_FILE")
+    emit_event "init" "$feature" "$branch" "$STACK" "$stories_json"
+    emit_event "status" "running"
+
+    ensure_worktree_root
+
+    local -a job_ids=()
+    local -a job_pids=()
+    local -a job_results=()
+
+    for iter in $(seq 1 "$RALPH_MAX_ITER"); do
+        emit_event "iteration" "$iter"
+
+        block_stories_with_blocked_deps
+
+        local remaining
+        remaining=$(remaining_count)
+
+        if ((remaining == 0)); then
+            local total done
+            total=$(jq '.stories | length' "$PRD_FILE")
+            done=$(jq '[.stories[] | select(.done)] | length' "$PRD_FILE")
+
+            if ((done == total)); then
+                printf '\n%s' "$GREEN"
+                printf '╔═══════════════════════════════════════════════════════════╗\n'
+                printf '║                  🎉 ALL STORIES COMPLETE!                 ║\n'
+                printf '╚═══════════════════════════════════════════════════════════╝\n'
+                printf '%s\n' "$RESET"
+                local duration="$((SECONDS / 60))m $((SECONDS % 60))s"
+                notify_webhook "complete" "$total" "$duration"
+                emit_event "complete"
+                emit_event "status" "complete"
+
+                [[ -n "$base_sha" ]] && generate_pr_summary "$base_sha"
+
+                return 0
+            fi
+
+            warn "Some stories blocked"
+            show_stories
+            emit_event "status" "error"
+            return 1
+        fi
+
+        show_progress "$iter"
+
+        while ((${#job_ids[@]} < RALPH_PARALLEL)); do
+            local next
+            next=$(get_next_story)
+            [[ -z "$next" ]] && break
+
+            local title tries story_json
+            title=$(jq -r --arg id "$next" '.stories[] | select(.id == $id) | .title' "$PRD_FILE")
+            tries=$(jq -r --arg id "$next" '.stories[] | select(.id == $id) | .tries' "$PRD_FILE")
+            story_json=$(jq -c --arg id "$next" '.stories[] | select(.id == $id) | {id, title, criteria, tries}' "$PRD_FILE")
+
+            printf '%s→%s %s%s%s: %s' "$CYAN" "$RESET" "$BOLD" "$next" "$RESET" "$title"
+            ((tries > 0)) && printf ' %s(attempt %d)%s' "$YELLOW" "$((tries + 1))" "$RESET"
+            printf '\n\n'
+
+            emit_event "story_start" "$story_json"
+            mark_running "$next"
+            mark_try "$next"
+
+            local base
+            base=$(git rev-parse HEAD 2>/dev/null || echo "")
+
+            local worktree_info
+            if ! worktree_info=$(create_story_worktree "$next" "$base"); then
+                warn "Failed to create worktree for $next"
+                mark_blocked "$next" "worktree create failed"
+                mark_stopped "$next"
+                continue
+            fi
+
+            local worktree_path="${worktree_info%%|*}"
+            local worktree_branch="${worktree_info##*|}"
+            local result_file="$RALPH_DIR/jobs/${next}.$RANDOM.result.json"
+
+            mkdir -p "$RALPH_DIR/jobs"
+            run_story_job "$next" "$worktree_path" "$worktree_branch" "$base" "$result_file" &
+
+            job_ids+=("$next")
+            job_pids+=("$!")
+            job_results+=("$result_file")
+        done
+
+        local i=0
+        while ((i < ${#job_ids[@]})); do
+            local result_file="${job_results[$i]}"
+            if [[ -f "$result_file" ]]; then
+                local pid="${job_pids[$i]}"
+                wait "$pid" 2>/dev/null || true
+
+                handle_job_result "$result_file"
+
+                job_ids=("${job_ids[@]:0:$i}" "${job_ids[@]:$((i + 1))}")
+                job_pids=("${job_pids[@]:0:$i}" "${job_pids[@]:$((i + 1))}")
+                job_results=("${job_results[@]:0:$i}" "${job_results[@]:$((i + 1))}")
+                continue
+            fi
+            ((i++))
+        done
+
+        ((PARALLEL_FAILS >= 5)) && { err "Too many consecutive failures"; emit_event "status" "error"; return 1; }
+
+        show_stories
+        sleep 1
+    done
+
+    warn "Max iterations reached"
+    emit_event "status" "error"
+    return 1
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# CLI
+#───────────────────────────────────────────────────────────────────────────────
+usage() {
+    cat << EOF
+${BOLD}${BRAND_NAME} v$VERSION${RESET} - Autonomous AI Coding Orchestrator
+
+${BOLD}Usage:${RESET}
+  $SCRIPT_NAME "feature description"    Start new feature
+  $SCRIPT_NAME --resume                 Resume last session
+  $SCRIPT_NAME --status                 Show progress
+  $SCRIPT_NAME --reset                  Clear workspace
+
+${BOLD}Options:${RESET}
+  -i, --iterations N    Max iterations (default: $RALPH_MAX_ITER)
+  -p, --parallel N      Parallel agents (default: $RALPH_PARALLEL)
+  -t, --timeout N       Timeout per story in seconds (default: $RALPH_TIMEOUT)
+  --safe                Don't pass --dangerously-skip-permissions
+  --no-verify           Skip verification (typecheck/tests)
+  --no-dashboard        Don't open web dashboard
+  --no-open             Don't open dashboard in browser
+  --public              Expose dashboard with a tunnel
+  --no-public           Disable public dashboard tunnel
+  --yolo                Max autonomy + max parallel + public dashboard
+  --isolate             Use git worktree isolation
+  --dry-run             Generate PRD and exit
+  --no-commit           Disable auto-commit fallback
+  -v, --verbose         Verbose output
+  -q, --quiet           Minimal output
+  -h, --help            Show this help
+
+${BOLD}Environment:${RESET}
+  RALPH_CLAUDE=claude           Claude binary
+  RALPH_MODEL=                  Model override
+  RALPH_WEBHOOK=url             Webhook for notifications
+  RALPH_WEBHOOK_KIND=auto       auto|slack|discord|generic
+  RALPH_MAX_ITER=100            Max iterations
+  RALPH_MAX_TRIES=3             Max tries per story
+  RALPH_TIMEOUT=600             Timeout in seconds
+  RALPH_DASHBOARD=1             Enable dashboard (1=on, 0=off)
+  RALPH_DASHBOARD_PORT=3333     Dashboard port
+  RALPH_DASHBOARD_HOST=127.0.0.1 Bind host for dashboard
+  RALPH_DASHBOARD_OPEN=1        Open dashboard in browser
+  RALPH_PUBLIC=1                Start public tunnel for dashboard
+  RALPH_TUNNEL=auto             auto|cloudflared|ngrok|none
+  RALPH_STREAM_AI=1             Stream AI output to dashboard
+  RALPH_DRY_RUN=0               Dry-run mode
+  RALPH_NO_COMMIT=0             Disable auto-commit fallback
+  RALPH_USAGE_TRACKING=1        Estimate usage and cost
+  RALPH_TOKEN_COST=             Cost per 1k tokens (optional)
+  RALPH_WORKTREE_ROOT=          Worktree base directory
+
+${BOLD}Examples:${RESET}
+  $SCRIPT_NAME "Add user authentication with email/password and OAuth"
+  $SCRIPT_NAME "Build REST API for todo items with CRUD operations"
+  RALPH_WEBHOOK="https://hooks.slack.com/..." $SCRIPT_NAME "feature"
+
+${BOLD}Output:${RESET}
+  .ralph/prd.json           Generated user stories
+  .ralph/memory.md          Learning from successes/failures
+  .ralph/pr_summary.md      Auto-generated PR description
+  .ralph/usage.jsonl        Estimated token usage
+  .ralph/ralph.log          Full execution log
+  .ralph/attempts/          Per-story attempt logs
+EOF
+}
+
+main() {
+    local feature="" resume=0 status_only=0 reset=0 yolo=0
+    local explicit_parallel=0 explicit_timeout=0 explicit_iter=0
+    local explicit_no_verify=0 explicit_no_dashboard=0 explicit_no_open=0 explicit_public=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help) usage; exit 0 ;;
+            -v|--verbose) LOG_LEVEL=3; shift ;;
+            -q|--quiet) LOG_LEVEL=0; shift ;;
+            -i|--iterations) require_int "$1" "${2:-}" 1; RALPH_MAX_ITER="$2"; explicit_iter=1; shift 2 ;;
+            -p|--parallel) require_int "$1" "${2:-}" 1; RALPH_PARALLEL="$2"; explicit_parallel=1; shift 2 ;;
+            -t|--timeout) require_int "$1" "${2:-}" 0; RALPH_TIMEOUT="$2"; explicit_timeout=1; shift 2 ;;
+            --safe) RALPH_SAFE=1; shift ;;
+            --no-verify) RALPH_VERIFY=0; explicit_no_verify=1; shift ;;
+            --no-dashboard) RALPH_DASHBOARD=0; explicit_no_dashboard=1; shift ;;
+            --no-open) RALPH_DASHBOARD_OPEN=0; explicit_no_open=1; shift ;;
+            --public) RALPH_PUBLIC=1; explicit_public=1; shift ;;
+            --no-public) RALPH_PUBLIC=0; explicit_public=1; shift ;;
+            --yolo) yolo=1; shift ;;
+            --isolate) RALPH_ISOLATE=1; shift ;;
+            --dry-run) RALPH_DRY_RUN=1; shift ;;
+            --no-commit) RALPH_NO_COMMIT=1; shift ;;
+            --resume) resume=1; shift ;;
+            --status) status_only=1; shift ;;
+            --reset) reset=1; shift ;;
+            --) shift; break ;;
+            -*) die "Unknown option: $1" ;;
+            *) feature="$1"; shift ;;
+        esac
+    done
+
+    if ((yolo)); then
+        local cpu agents
+        cpu=$(detect_cpu_count)
+        agents=$cpu
+        ((agents < 2)) && agents=2
+
+        ((explicit_parallel == 0)) && RALPH_PARALLEL="$agents"
+        ((explicit_iter == 0)) && RALPH_MAX_ITER=200
+        ((explicit_timeout == 0)) && RALPH_TIMEOUT=900
+        ((explicit_no_verify == 0)) && RALPH_VERIFY=1
+        ((explicit_no_dashboard == 0)) && RALPH_DASHBOARD=1
+        ((explicit_no_open == 0)) && RALPH_DASHBOARD_OPEN=1
+        ((explicit_public == 0)) && RALPH_PUBLIC=1
+
+        RALPH_ISOLATE=1
+        RALPH_STREAM_AI=1
+        RALPH_TUNNEL="auto"
+        RALPH_DASHBOARD_HOST="0.0.0.0"
+    fi
+
+    printf '%s' "$CYAN"
+    cat << 'EOF'
+
+    ██████╗  █████╗ ██╗     ██████╗ ██╗  ██╗
+    ██╔══██╗██╔══██╗██║     ██╔══██╗██║  ██║
+    ██████╔╝███████║██║     ██████╔╝███████║
+    ██╔══██╗██╔══██║██║     ██╔═══╝ ██╔══██║
+    ██║  ██║██║  ██║███████╗██║     ██║  ██║
+    ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝     ╚═╝  ╚═╝
+
+EOF
+    printf '%s    %s v%s - Autonomous AI Coding%s\n\n' "$DIM" "$BRAND_NAME" "$VERSION" "$RESET"
+
+    require jq
+    require "$RALPH_CLAUDE" "@anthropic-ai/claude-code"
+    require git
+    require python3 "python3"
+
+    ensure_git_repo
+    detect_timeout_cmd
+
+    local repo_root
+    repo_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "$RALPH_ROOT")
+    RALPH_ROOT="$repo_root"
+    if [[ "$RALPH_DIR" != /* ]]; then
+        RALPH_DIR="$RALPH_ROOT/$RALPH_DIR"
+    fi
+    SESSION_FILE="$RALPH_DIR/session.json"
+
+    if ((reset)); then
+        cleanup_session_worktree
+        rm -rf "$RALPH_DIR"
+        ok "Workspace cleared"
+        exit 0
+    fi
+
+    mkdir -p "$RALPH_DIR"
+    mkdir -p "$RALPH_DIR/attempts"
+    LOG_FILE="$RALPH_DIR/ralph.log"
+    PRD_FILE="$RALPH_DIR/prd.json"
+    LOCK_FILE="$RALPH_DIR/.lock"
+
+    if ((yolo)); then
+        info "YOLO mode: parallel=$RALPH_PARALLEL isolate=1 public=$RALPH_PUBLIC"
+    fi
+
+    if [[ -d .git ]] && ! grep -q "^\.ralph" .gitignore 2>/dev/null; then
+        printf '%s\n' ".ralph/" >> .gitignore
+        debug "Added .ralph/ to .gitignore"
+    fi
+
+    if [[ -f "$LOCK_FILE" ]]; then
+        local pid
+        pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            die "Another instance running (PID: $pid)"
+        fi
+    fi
+    printf '%s' "$$" > "$LOCK_FILE"
+
+    if ((RALPH_PARALLEL > 1)) && ((RALPH_ISOLATE == 0)); then
+        warn "Parallel requires --isolate; forcing sequential mode"
+        RALPH_PARALLEL=1
+    fi
+
+    detect_stack
+    info "Stack: ${BOLD}$STACK${RESET} | Pkg: ${PKG_MGR:-?}"
+    [[ -n "$TYPE_CMD" ]] && debug "Typecheck: $TYPE_CMD"
+    [[ -n "$TEST_CMD" ]] && debug "Test: $TEST_CMD"
+
+    if ((status_only)); then
+        [[ -f "$PRD_FILE" ]] || die "No active session"
+        show_progress 0
+        show_stories
+        exit 0
+    fi
+
+    if ((resume)); then
+        [[ -f "$PRD_FILE" ]] || die "Nothing to resume"
+        validate_prd
+        feature=$(jq -r '.feature // "unknown"' "$PRD_FILE")
+        info "Resuming: $feature"
+    elif [[ -f "$PRD_FILE" ]]; then
+        local existing
+        existing=$(jq -r '.feature' "$PRD_FILE")
+        printf '%sExisting session:%s %s\n' "$YELLOW" "$RESET" "$existing"
+        printf 'Continue? [Y/n] '
+        read -r reply
+        if [[ "$reply" =~ ^[Nn] ]]; then
+            [[ -z "$feature" ]] && die "Provide feature or use --reset"
+            rm -f "$PRD_FILE"
+            generate_prd "$feature"
+        fi
+    else
+        [[ -z "$feature" ]] && { usage; exit 1; }
+        generate_prd "$feature"
+        printf '%s\n' "# ${BRAND_NAME} Memory" > "$RALPH_DIR/memory.md"
+    fi
+
+    validate_prd
+
+    if ((RALPH_DRY_RUN)); then
+        ok "Dry-run: PRD generated at $PRD_FILE"
+        show_stories
+        exit 0
+    fi
+
+    local branch base_sha
+    branch=$(jq -r '.branch // "ralph/feature"' "$PRD_FILE")
+    branch=$(sanitize_git_branch "$branch")
+    jq_inplace "$PRD_FILE" --arg b "$branch" '.branch = $b' || true
+
+    base_sha=$(git rev-parse HEAD 2>/dev/null || echo "")
+
+    if ((RALPH_ISOLATE == 0)); then
+        checkout_branch_or_die "$branch"
+    elif ((RALPH_PARALLEL > 1)); then
+        # Controller must be on the feature branch for cherry-picks.
+        checkout_branch_or_die "$branch"
+        info "Worktree isolation enabled (per-story)"
+    else
+        # Session worktree isolation: keep the branch checked out in the worktree.
+        if [[ -n "$base_sha" ]]; then
+            enter_session_worktree "$branch" "$base_sha" || {
+                warn "Failed to create session worktree; continuing without isolation"
+                checkout_branch_or_die "$branch"
+            }
+        else
+            warn "Unable to determine base SHA; continuing without isolation"
+            checkout_branch_or_die "$branch"
+        fi
+    fi
+
+    start_dashboard
+
+    show_stories
+    printf '\n'
+
+    SECONDS=0
+    notify_webhook "start" "$feature"
+
+    if ((RALPH_PARALLEL > 1)); then
+        run_loop_parallel
+    else
+        run_loop_sequential
+    fi
+
+    if [[ -f "$RALPH_DIR/usage.jsonl" ]]; then
+        local total_tokens
+        total_tokens=$(jq -s '[.[].total_tokens] | add // 0' "$RALPH_DIR/usage.jsonl" 2>/dev/null || echo 0)
+        if [[ -n "$total_tokens" && "$total_tokens" != "0" ]]; then
+            info "Estimated tokens: $total_tokens"
+        fi
+    fi
+}
+
+main "$@"

@@ -1,0 +1,31 @@
+# Ralph workspace
+.ralph/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Logs and temp
+*.log
+*.tmp
+*.swp
+
+# Node
+node_modules/
+dist/
+build/
+
+# Python
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+
+# Rust
+/target/
+
+# Go
+/bin/

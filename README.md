@@ -1,6 +1,6 @@
-# RALPHdavai
+# RALPHdavai (DAVAI RALPH DAVAI)
 
-РАЛЬФ is an autonomous AI coding orchestrator that plans, executes, verifies, and summarizes work across a repo.
+DAVAI RALPH DAVAI is an autonomous AI coding orchestrator that plans, executes, verifies, and summarizes work across a repo.
 
 ## Features
 - Multi-stack detection (Node/Python/Rust/Go/Ruby)

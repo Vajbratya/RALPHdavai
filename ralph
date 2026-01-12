@@ -1450,7 +1450,7 @@ analyze_codebase() {
             -g "*.ts" -g "*.tsx" -g "*.js" -g "*.jsx" -g "*.py" -g "*.go" -g "*.rs" -g "*.rb" \
             -g "!**/node_modules/**" -g "!**/.git/**" -g "!**/dist/**" -g "!**/build/**" \
             -g "!**/__pycache__/**" -g "!**/.venv/**" -g "!**/target/**" -g "!**/.ralph/**" \
-            -g "!**/vendor/**" | head -50)
+            -g "!**/vendor/**" 2>/dev/null | head -50 || true)
     else
         files=$(find . -type f \( \
             -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \
@@ -1458,7 +1458,7 @@ analyze_codebase() {
             \) ! -path "*/node_modules/*" ! -path "*/.git/*" ! -path "*/dist/*" \
             ! -path "*/build/*" ! -path "*/__pycache__/*" ! -path "*/.venv/*" \
             ! -path "*/target/*" ! -path "*/.ralph/*" ! -path "*/vendor/*" \
-            2>/dev/null | sort | head -50)
+            2>/dev/null | sort | head -50 || true)
     fi
 
     output+="## Project Structure\n\`\`\`\n$files\n\`\`\`\n\n"
